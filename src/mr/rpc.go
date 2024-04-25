@@ -6,7 +6,10 @@ package mr
 // remember to capitalize all names.
 //
 
-import "os"
+import (
+	"os"
+	"time"
+)
 import "strconv"
 
 //
@@ -23,7 +26,24 @@ type ExampleReply struct {
 }
 
 // Add your RPC definitions here.
+type taskType int
 
+const (
+	MapTask taskType = iota
+	ReduceTask
+	NothingToDo
+)
+
+type task struct {
+	taskType
+	workerId   int
+	filename   string
+	hasExpired <-chan time.Time
+}
+
+type worker struct {
+	workerId int
+}
 
 // Cook up a unique-ish UNIX-domain socket name
 // in /var/tmp, for the coordinator.
