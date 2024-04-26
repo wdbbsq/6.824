@@ -26,23 +26,25 @@ type ExampleReply struct {
 }
 
 // Add your RPC definitions here.
-type taskType int
+type TaskType int
 
 const (
-	MapTask taskType = iota
+	MapTask TaskType = iota
 	ReduceTask
 	NothingToDo
 )
 
-type task struct {
-	taskType
-	workerId   int
-	filename   string
-	hasExpired <-chan time.Time
+type Task struct {
+	TaskType
+	TaskId   int
+	Filename string
+	Timer    *time.Timer
 }
 
-type worker struct {
-	workerId int
+type NewTaskReply struct {
+	NewTask *Task
+	NMap    int
+	NReduce int
 }
 
 // Cook up a unique-ish UNIX-domain socket name

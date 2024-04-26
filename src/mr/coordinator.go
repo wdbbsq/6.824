@@ -22,40 +22,52 @@ const (
 
 type Coordinator struct {
 	// Your definitions here.
+	nMap         int
 	nReduce      int
-	files        []string
-	tasks        map[taskType]chan *task
-	intermediate string
+	tasks        map[TaskType][]*Task
+	workingTasks []*Task
 
 	stage
 	lock sync.Mutex
 }
 
 // Your code here -- RPC handlers for the worker to call.
-// alloc new task to worker
-func (c *Coordinator) NewTask(_ struct{}, reply *task) error {
+// alloc new Task to worker
+func (c *Coordinator) NewTask(_ EmptyArgs, reply *NewTaskReply) error {
 	c.lock.Lock()
 	defer c.lock.Unlock()
 
+	reply.NMap = c.nMap
+	reply.NReduce = c.nReduce
 	switch c.stage {
 	case Mapping:
-		c.findAvailableTask(MapTask)
-		reply.taskType = MapTask
-		reply.hasExpired = time.After(TaskTimeout)
+		c.findAvailableTask(MapTask, reply.NewTask)
 	case Reducing:
-		reply.taskType = ReduceTask
+		c.findAvailableTask(ReduceTask, reply.NewTask)
 	case EverythingOkay:
-		reply.taskType = NothingToDo
+		reply.NewTask.TaskType = NothingToDo
 	}
 	return nil
 }
 
-// store result of map task
-func (c *Coordinator) StoreIntermediate(_ struct{}, reply *task) error {
-	return nil
-}
-
-func (c *Coordinator) ReduceDone(_ struct{}, reply *task) error {
+func (c *Coordinator) MarkTaskDone(args *Task, _ EmptyArgs) error {
+	c.lock.Lock()
+	defer c.lock.Unlock()
+	// delete from workingTasks
+	j := 0
+	for _, t := range c.workingTasks {
+		if t.TaskId != args.TaskId {
+			c.workingTasks[j] = t
+			j++
+		}
+	}
+	c.workingTasks = c.workingTasks[:j]
+	// todo is necessary to check expire here?
+	select {
+	case <-args.Timer.C:
+		c.tasks[args.TaskType] = append(c.tasks[args.TaskType], args)
+	default:
+	}
 	return nil
 }
 
@@ -67,20 +79,46 @@ func (c *Coordinator) Example(args *ExampleArgs, reply *ExampleReply) error {
 	return nil
 }
 
-func (c *Coordinator) findAvailableTask(t taskType) (reply *task) {
-	// todo check any working task has expired
+func (c *Coordinator) checkExpiredTask() {
+	count := 0
+	for _, t := range c.workingTasks {
+		select {
+		case <-t.Timer.C:
+			// add back to tasks
+			c.tasks[t.TaskType] = append(c.tasks[t.TaskType], t)
+		default:
+			c.workingTasks[count] = t
+			count++
+		}
+	}
+	c.workingTasks = c.workingTasks[:count]
+}
 
-	if len(c.tasks[t]) == 0 {
+func (c *Coordinator) findAvailableTask(t TaskType, reply *Task) {
+	c.checkExpiredTask()
+	if len(c.tasks[t]) == 0 && len(c.workingTasks) == 0 {
 		switch t {
 		case MapTask:
 			c.stage = Reducing
+			c.buildReduceTasks()
 		case ReduceTask:
 			c.stage = EverythingOkay
-		case NothingToDo:
+			log.Println("Finished all tasks. Quitting...")
+			return
+		default:
+			log.Println("Unknown Task type when findAvailableTask: ", t)
 		}
-		return
 	}
-	reply = <-c.tasks[t]
+	// copy fields not ptr
+	targetTask := c.tasks[t][0]
+	reply.TaskId = targetTask.TaskId
+	reply.TaskType = t
+	reply.Filename = targetTask.Filename
+	// delete targetTask
+	c.tasks[t] = c.tasks[t][1:]
+	// start timing
+	targetTask.Timer.Reset(TaskTimeout)
+	c.workingTasks = append(c.workingTasks, targetTask)
 	return
 }
 
@@ -104,16 +142,25 @@ func (c *Coordinator) Done() bool {
 	ret := false
 
 	// Your code here.
+	c.lock.Lock()
+	ret = c.stage == EverythingOkay
+	defer c.lock.Unlock()
 
 	return ret
 }
 
 // create a Coordinator.
 // main/mrcoordinator.go calls this function.
-// nReduce is the number of reduce tasks to use.
+// NReduce is the number of reduce tasks to use.
 func MakeCoordinator(files []string, nReduce int) *Coordinator {
-	c := Coordinator{}
-
+	c := Coordinator{
+		nMap:         len(files),
+		nReduce:      nReduce,
+		tasks:        make(map[TaskType][]*Task),
+		workingTasks: make([]*Task, 0, len(files)),
+		stage:        Mapping,
+		lock:         sync.Mutex{},
+	}
 	// Your code here.
 	c.buildMapTasks(files)
 
@@ -122,14 +169,26 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 }
 
 func (c *Coordinator) buildMapTasks(files []string) {
-	// todo buffered channel or not?
-	taskCh := make(chan *task, len(files))
-	for _, file := range files {
-		taskCh <- &task{
-			taskType:   MapTask,
-			filename:   file,
-			hasExpired: nil,
-		}
+	tasks := make([]*Task, 0, len(files))
+	for i, file := range files {
+		tasks = append(tasks, &Task{
+			TaskId:   i,
+			TaskType: MapTask,
+			Filename: file,
+			Timer:    time.NewTimer(TaskTimeout),
+		})
 	}
-	c.tasks[MapTask] = taskCh
+	c.tasks[MapTask] = tasks
+}
+
+func (c *Coordinator) buildReduceTasks() {
+	tasks := make([]*Task, c.nReduce)
+	for i := 0; i < c.nReduce; i++ {
+		tasks = append(tasks, &Task{
+			TaskId:   i,
+			TaskType: ReduceTask,
+			Timer:    time.NewTimer(TaskTimeout),
+		})
+	}
+	c.tasks[ReduceTask] = tasks
 }
