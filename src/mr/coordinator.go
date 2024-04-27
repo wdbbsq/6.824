@@ -33,7 +33,7 @@ type Coordinator struct {
 
 // Your code here -- RPC handlers for the worker to call.
 // alloc new Task to worker
-func (c *Coordinator) NewTask(_ EmptyArgs, reply *NewTaskReply) error {
+func (c *Coordinator) NewTask(_ *EmptyArgs, reply *NewTaskReply) error {
 	c.lock.Lock()
 	defer c.lock.Unlock()
 
@@ -41,31 +41,35 @@ func (c *Coordinator) NewTask(_ EmptyArgs, reply *NewTaskReply) error {
 	reply.NReduce = c.nReduce
 	switch c.stage {
 	case Mapping:
-		c.findAvailableTask(MapTask, reply.NewTask)
+		c.findAvailableTask(MapTask, reply)
 	case Reducing:
-		c.findAvailableTask(ReduceTask, reply.NewTask)
+		c.findAvailableTask(ReduceTask, reply)
 	case EverythingOkay:
-		reply.NewTask.TaskType = NothingToDo
+		reply.TaskType = NothingToDo
 	}
 	return nil
 }
 
-func (c *Coordinator) MarkTaskDone(args *Task, _ EmptyArgs) error {
+func (c *Coordinator) MarkFinishedTask(args *MarkFinishedTaskRequest, _ *EmptyArgs) error {
 	c.lock.Lock()
 	defer c.lock.Unlock()
 	// delete from workingTasks
 	j := 0
+	var finishedTask *Task
 	for _, t := range c.workingTasks {
 		if t.TaskId != args.TaskId {
 			c.workingTasks[j] = t
 			j++
+		} else {
+			finishedTask = t
 		}
 	}
 	c.workingTasks = c.workingTasks[:j]
 	// todo is necessary to check expire here?
 	select {
-	case <-args.Timer.C:
-		c.tasks[args.TaskType] = append(c.tasks[args.TaskType], args)
+	case <-finishedTask.Timer.C:
+		c.tasks[args.TaskType] = append(c.tasks[args.TaskType], finishedTask)
+		log.Println("Task-", args.TaskType, "-", args.TaskId, " expired.")
 	default:
 	}
 	return nil
@@ -94,13 +98,14 @@ func (c *Coordinator) checkExpiredTask() {
 	c.workingTasks = c.workingTasks[:count]
 }
 
-func (c *Coordinator) findAvailableTask(t TaskType, reply *Task) {
+func (c *Coordinator) findAvailableTask(t TaskType, reply *NewTaskReply) {
 	c.checkExpiredTask()
 	if len(c.tasks[t]) == 0 && len(c.workingTasks) == 0 {
 		switch t {
 		case MapTask:
 			c.stage = Reducing
 			c.buildReduceTasks()
+			log.Println("Map tasks are all done.")
 		case ReduceTask:
 			c.stage = EverythingOkay
 			log.Println("Finished all tasks. Quitting...")
@@ -108,6 +113,11 @@ func (c *Coordinator) findAvailableTask(t TaskType, reply *Task) {
 		default:
 			log.Println("Unknown Task type when findAvailableTask: ", t)
 		}
+	}
+	if len(c.tasks[t]) == 0 {
+		// no task in the task pool
+		reply.TaskType = NothingToDo
+		return
 	}
 	// copy fields not ptr
 	targetTask := c.tasks[t][0]
@@ -119,6 +129,7 @@ func (c *Coordinator) findAvailableTask(t TaskType, reply *Task) {
 	// start timing
 	targetTask.Timer.Reset(TaskTimeout)
 	c.workingTasks = append(c.workingTasks, targetTask)
+	log.Println("Task-", targetTask.TaskType, "-", targetTask.TaskId, " allocated.")
 	return
 }
 
@@ -162,7 +173,9 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 		lock:         sync.Mutex{},
 	}
 	// Your code here.
+	c.lock.Lock()
 	c.buildMapTasks(files)
+	c.lock.Unlock()
 
 	c.server()
 	return &c

@@ -41,10 +41,20 @@ type Task struct {
 	Timer    *time.Timer
 }
 
+type MarkFinishedTaskRequest struct {
+	TaskType
+	TaskId int
+}
+
+type NewTaskRequest struct {
+}
+
 type NewTaskReply struct {
-	NewTask *Task
-	NMap    int
-	NReduce int
+	TaskType
+	TaskId   int
+	Filename string
+	NMap     int
+	NReduce  int
 }
 
 // Cook up a unique-ish UNIX-domain socket name

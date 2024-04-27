@@ -37,8 +37,8 @@ func ihash(key string) int {
 type EmptyArgs struct{}
 
 const (
-	NewTaskRpc   = "Coordinator.NewTask"
-	MarkTaskDone = "Coordinator.MarkTaskDone"
+	NewTaskRpc       = "Coordinator.NewTask"
+	MarkFinishedTask = "Coordinator.MarkFinishedTask"
 )
 
 // main/mrworker.go calls this function.
@@ -46,31 +46,27 @@ func Worker(mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
 	// to reuse workers
 	for {
-		task := Task{}
-		reply := NewTaskReply{
-			NewTask: &task,
-		}
-		if !call(NewTaskRpc, EmptyArgs{}, &reply) {
+		reply := NewTaskReply{}
+		if !call(NewTaskRpc, &EmptyArgs{}, &reply) {
 			log.Println("RPC call failed: ", NewTaskRpc, ", reply: ", reply)
 			return
 		}
-		log.Println("#### ", reply)
-		switch task.TaskType {
+		switch reply.TaskType {
 		case MapTask:
-			doMap(mapf, task, reply.NReduce)
+			doMap(mapf, reply)
 		case ReduceTask:
-			doReduce(reducef, task, reply.NMap)
+			doReduce(reducef, reply)
 		case NothingToDo:
 			log.Println("Everything done, quit...")
 			return
 		default:
-			log.Println("Unknown TaskType: ", task.TaskType)
+			log.Println("Unknown TaskType: ", reply.TaskType)
 		}
 		time.Sleep(time.Second)
 	}
 }
 
-func doMap(mapf func(string, string) []KeyValue, t Task, nReduce int) {
+func doMap(mapf func(string, string) []KeyValue, t NewTaskReply) {
 	// read file
 	file, err := os.Open(t.Filename)
 	if err != nil {
@@ -85,8 +81,7 @@ func doMap(mapf func(string, string) []KeyValue, t Task, nReduce int) {
 	// spilt into buckets
 	intermediate := make(map[int][]KeyValue)
 	for _, kv := range kva {
-		fmt.Println(kv.Key, kv.Value)
-		y := ihash(kv.Key) % nReduce
+		y := ihash(kv.Key) % t.NReduce
 		if _, ok := intermediate[y]; !ok {
 			intermediate[y] = make([]KeyValue, 0)
 		}
@@ -106,19 +101,23 @@ func doMap(mapf func(string, string) []KeyValue, t Task, nReduce int) {
 		jsonFile.Close()
 	}
 	// inform coordinator
-	if !call(MarkTaskDone, t, EmptyArgs{}) {
-		log.Println("RPC call failed: ", MarkTaskDone)
+	finishedTask := MarkFinishedTaskRequest{
+		TaskType: t.TaskType,
+		TaskId:   t.TaskId,
+	}
+	if !call(MarkFinishedTask, &finishedTask, &EmptyArgs{}) {
+		log.Println("RPC call failed: ", MarkFinishedTask)
 		return
 	}
 }
 
-func doReduce(reducef func(string, []string) string, t Task, nMap int) {
+func doReduce(reducef func(string, []string) string, t NewTaskReply) {
 	defer func() {
 		// clean up tmp files
 	}()
 	// read from files
 	intermediate := make([]KeyValue, 0)
-	for i := 0; i < nMap; i++ {
+	for i := 0; i < t.NMap; i++ {
 		filename := fmt.Sprintf("mr-%v-%v", i, t.TaskId)
 		file, err := os.Open(filename)
 		if err != nil {
@@ -157,8 +156,12 @@ func doReduce(reducef func(string, []string) string, t Task, nMap int) {
 		i = j
 	}
 	// inform coordinator
-	if !call(MarkTaskDone, t, EmptyArgs{}) {
-		log.Println("RPC call failed: ", MarkTaskDone)
+	finishedTask := MarkFinishedTaskRequest{
+		TaskType: t.TaskType,
+		TaskId:   t.TaskId,
+	}
+	if !call(MarkFinishedTask, &finishedTask, &EmptyArgs{}) {
+		log.Println("RPC call failed: ", MarkFinishedTask)
 		return
 	}
 }
