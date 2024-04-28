@@ -55,7 +55,6 @@ func main() {
 	// intermediate data is in one place, intermediate[],
 	// rather than being partitioned into NxM buckets.
 	//
-	fmt.Println(intermediate[:10])
 	sort.Sort(ByKey(intermediate))
 
 	oname := "mr-out-0"

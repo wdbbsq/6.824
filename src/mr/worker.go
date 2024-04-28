@@ -89,7 +89,7 @@ func doMap(mapf func(string, string) []KeyValue, t NewTaskReply) {
 	}
 	// write into files
 	for y, kvs := range intermediate {
-		filename := fmt.Sprintf("mr-%v-%v", t.TaskId, y)
+		filename := fmt.Sprintf("./tmp/mr-%v-%v", t.TaskId, y)
 		jsonFile, err := os.Create(filename)
 		if err != nil {
 			log.Fatalf("cannot open %v", filename)
@@ -106,7 +106,6 @@ func doMap(mapf func(string, string) []KeyValue, t NewTaskReply) {
 		TaskId:   t.TaskId,
 	}
 	if !call(MarkFinishedTask, &finishedTask, &EmptyArgs{}) {
-		log.Println("RPC call failed: ", MarkFinishedTask)
 		return
 	}
 }
@@ -118,7 +117,7 @@ func doReduce(reducef func(string, []string) string, t NewTaskReply) {
 	// read from files
 	intermediate := make([]KeyValue, 0)
 	for i := 0; i < t.NMap; i++ {
-		filename := fmt.Sprintf("mr-%v-%v", i, t.TaskId)
+		filename := fmt.Sprintf("./tmp/mr-%v-%v", i, t.TaskId)
 		file, err := os.Open(filename)
 		if err != nil {
 			log.Fatalf("cannot open %v", filename)
@@ -161,7 +160,6 @@ func doReduce(reducef func(string, []string) string, t NewTaskReply) {
 		TaskId:   t.TaskId,
 	}
 	if !call(MarkFinishedTask, &finishedTask, &EmptyArgs{}) {
-		log.Println("RPC call failed: ", MarkFinishedTask)
 		return
 	}
 }
@@ -201,7 +199,7 @@ func call(rpcname string, args interface{}, reply interface{}) bool {
 
 	err = c.Call(rpcname, args, reply)
 
-	fmt.Println("Response: ", reply, err)
+	log.Println("From ", rpcname, "Response: ", reply, " Err: ", err)
 
 	if err == nil {
 		return true

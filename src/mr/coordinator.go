@@ -65,13 +65,17 @@ func (c *Coordinator) MarkFinishedTask(args *MarkFinishedTaskRequest, _ *EmptyAr
 		}
 	}
 	c.workingTasks = c.workingTasks[:j]
-	// todo is necessary to check expire here?
+	log.Println("Finished Task: ", finishedTask)
+	// check expiration
 	select {
 	case <-finishedTask.Timer.C:
 		c.tasks[args.TaskType] = append(c.tasks[args.TaskType], finishedTask)
 		log.Println("Task-", args.TaskType, "-", args.TaskId, " expired.")
+		return nil
 	default:
 	}
+	// stop timer
+	finishedTask.Timer.Stop()
 	return nil
 }
 
@@ -106,6 +110,7 @@ func (c *Coordinator) findAvailableTask(t TaskType, reply *NewTaskReply) {
 			c.stage = Reducing
 			c.buildReduceTasks()
 			log.Println("Map tasks are all done.")
+			t = ReduceTask
 		case ReduceTask:
 			c.stage = EverythingOkay
 			log.Println("Finished all tasks. Quitting...")
@@ -124,7 +129,7 @@ func (c *Coordinator) findAvailableTask(t TaskType, reply *NewTaskReply) {
 	reply.TaskId = targetTask.TaskId
 	reply.TaskType = t
 	reply.Filename = targetTask.Filename
-	// delete targetTask
+	// delete targetTask from task pool
 	c.tasks[t] = c.tasks[t][1:]
 	// start timing
 	targetTask.Timer.Reset(TaskTimeout)
@@ -168,28 +173,41 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 		nMap:         len(files),
 		nReduce:      nReduce,
 		tasks:        make(map[TaskType][]*Task),
-		workingTasks: make([]*Task, 0, len(files)),
+		workingTasks: make([]*Task, 0, MaxInt(len(files), nReduce)),
 		stage:        Mapping,
 		lock:         sync.Mutex{},
 	}
 	// Your code here.
 	c.lock.Lock()
+	defer c.lock.Unlock()
+	// clean tmp dir
+	err := os.RemoveAll("./tmp")
+	if err != nil {
+		log.Println("Trouble with clean tmp files: ", err)
+	}
+	err = os.Mkdir("./tmp", 0777)
+	if err != nil {
+		log.Println("Fail to create dir: ", err)
+		return nil
+	}
+
 	c.buildMapTasks(files)
-	c.lock.Unlock()
 
 	c.server()
+	log.Println("Coordinator started.")
 	return &c
 }
 
 func (c *Coordinator) buildMapTasks(files []string) {
-	tasks := make([]*Task, 0, len(files))
+	tasks := make([]*Task, len(files))
 	for i, file := range files {
-		tasks = append(tasks, &Task{
+		tasks[i] = &Task{
 			TaskId:   i,
 			TaskType: MapTask,
 			Filename: file,
 			Timer:    time.NewTimer(TaskTimeout),
-		})
+		}
+		tasks[i].Timer.Stop()
 	}
 	c.tasks[MapTask] = tasks
 }
@@ -197,11 +215,12 @@ func (c *Coordinator) buildMapTasks(files []string) {
 func (c *Coordinator) buildReduceTasks() {
 	tasks := make([]*Task, c.nReduce)
 	for i := 0; i < c.nReduce; i++ {
-		tasks = append(tasks, &Task{
+		tasks[i] = &Task{
 			TaskId:   i,
 			TaskType: ReduceTask,
 			Timer:    time.NewTimer(TaskTimeout),
-		})
+		}
+		tasks[i].Timer.Stop()
 	}
 	c.tasks[ReduceTask] = tasks
 }
