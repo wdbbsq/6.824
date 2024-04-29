@@ -39,6 +39,7 @@ type EmptyArgs struct{}
 const (
 	NewTaskRpc       = "Coordinator.NewTask"
 	MarkFinishedTask = "Coordinator.MarkFinishedTask"
+	TaskErrRpc       = "Coordinator.HandleTaskErr"
 )
 
 // main/mrworker.go calls this function.
@@ -47,6 +48,7 @@ func Worker(mapf func(string, string) []KeyValue,
 	// to reuse workers
 	for {
 		reply := NewTaskReply{}
+		// todo consider add worker id to distinguish each other
 		if !call(NewTaskRpc, &EmptyArgs{}, &reply) {
 			log.Println("RPC call failed: ", NewTaskRpc, ", reply: ", reply)
 			return
@@ -56,8 +58,8 @@ func Worker(mapf func(string, string) []KeyValue,
 			doMap(mapf, reply)
 		case ReduceTask:
 			doReduce(reducef, reply)
-		case NothingToDo:
-			log.Println("Everything done, quit...")
+		case EmptyTask:
+			log.Println("Worker got nothing to do, quit...")
 			return
 		default:
 			log.Println("Unknown TaskType: ", reply.TaskType)
@@ -70,12 +72,19 @@ func doMap(mapf func(string, string) []KeyValue, t NewTaskReply) {
 	// read file
 	file, err := os.Open(t.Filename)
 	if err != nil {
-		log.Fatalf("cannot open %v", t.Filename)
+		log.Printf("MapWorker cannot open %v, %v\n", t.Filename, err.Error())
+		request := HandleTaskErrRequest{
+			MapTaskId:    t.TaskId,
+			ReduceTaskId: -1,
+		}
+		call(TaskErrRpc, &request, &EmptyArgs{})
+		return
 	}
 	defer file.Close()
 	content, err := io.ReadAll(file)
 	if err != nil {
-		log.Fatalf("cannot read %v", t.Filename)
+		log.Printf("MapWorker cannot read %v, %v\n", t.Filename, err.Error())
+		return
 	}
 	kva := mapf(t.Filename, string(content))
 	// spilt into buckets
@@ -92,7 +101,9 @@ func doMap(mapf func(string, string) []KeyValue, t NewTaskReply) {
 		filename := fmt.Sprintf("./tmp/mr-%v-%v", t.TaskId, y)
 		jsonFile, err := os.Create(filename)
 		if err != nil {
-			log.Fatalf("cannot open %v", filename)
+			log.Printf("MapWorker cannot open %v, %v\n", filename, err.Error())
+
+			return
 		}
 		encoder := json.NewEncoder(jsonFile)
 		for _, kv := range kvs {
@@ -117,10 +128,18 @@ func doReduce(reducef func(string, []string) string, t NewTaskReply) {
 	// read from files
 	intermediate := make([]KeyValue, 0)
 	for i := 0; i < t.NMap; i++ {
+		// mr-MapTaskId-ReduceTaskId
 		filename := fmt.Sprintf("./tmp/mr-%v-%v", i, t.TaskId)
 		file, err := os.Open(filename)
 		if err != nil {
-			log.Fatalf("cannot open %v", filename)
+			log.Printf("ReduceWorker cannot open %v, %v\n", filename, err.Error())
+			// inform coordinator err occurred
+			request := HandleTaskErrRequest{
+				MapTaskId:    i,
+				ReduceTaskId: t.TaskId,
+			}
+			call(TaskErrRpc, &request, &EmptyArgs{})
+			return
 		}
 		defer file.Close()
 		decoder := json.NewDecoder(file)
@@ -199,7 +218,7 @@ func call(rpcname string, args interface{}, reply interface{}) bool {
 
 	err = c.Call(rpcname, args, reply)
 
-	log.Println("From ", rpcname, "Response: ", reply, " Err: ", err)
+	//log.Println("From", rpcname, "Response:", reply, " Err:", err)
 
 	if err == nil {
 		return true

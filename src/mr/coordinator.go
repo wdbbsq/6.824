@@ -24,6 +24,7 @@ type Coordinator struct {
 	// Your definitions here.
 	nMap         int
 	nReduce      int
+	files        []string
 	tasks        map[TaskType][]*Task
 	workingTasks []*Task
 
@@ -45,7 +46,7 @@ func (c *Coordinator) NewTask(_ *EmptyArgs, reply *NewTaskReply) error {
 	case Reducing:
 		c.findAvailableTask(ReduceTask, reply)
 	case EverythingOkay:
-		reply.TaskType = NothingToDo
+		reply.TaskType = EmptyTask
 	}
 	return nil
 }
@@ -53,29 +54,40 @@ func (c *Coordinator) NewTask(_ *EmptyArgs, reply *NewTaskReply) error {
 func (c *Coordinator) MarkFinishedTask(args *MarkFinishedTaskRequest, _ *EmptyArgs) error {
 	c.lock.Lock()
 	defer c.lock.Unlock()
-	// delete from workingTasks
-	j := 0
-	var finishedTask *Task
-	for _, t := range c.workingTasks {
-		if t.TaskId != args.TaskId {
-			c.workingTasks[j] = t
-			j++
-		} else {
-			finishedTask = t
-		}
-	}
-	c.workingTasks = c.workingTasks[:j]
-	log.Println("Finished Task: ", finishedTask)
+
+	finishedTask := c.deleteFromWorkingTasks(args.TaskId, args.TaskType)
+
 	// check expiration
 	select {
 	case <-finishedTask.Timer.C:
-		c.tasks[args.TaskType] = append(c.tasks[args.TaskType], finishedTask)
+		c.append2Tasks(finishedTask)
 		log.Println("Task-", args.TaskType, "-", args.TaskId, " expired.")
-		return nil
 	default:
+		log.Println("Finished Task: ", finishedTask)
 	}
 	// stop timer
 	finishedTask.Timer.Stop()
+	return nil
+}
+
+// HandleTaskErr would reschedule working tasks
+// when map or reduce workers having trouble
+func (c *Coordinator) HandleTaskErr(args *HandleTaskErrRequest, _ *EmptyArgs) error {
+	//c.lock.Lock()
+	//defer c.lock.Unlock()
+	//
+	//// rebuild map task
+	//mapTask := c.deleteFromWorkingTasks(args.MapTaskId, MapTask)
+	//c.append2Tasks(mapTask)
+	//
+	//c.stage = Mapping
+	//
+	//if args.ReduceTaskId >= 0 {
+	//	// rebuild reduce task
+	//	reduceTask := c.deleteFromWorkingTasks(args.ReduceTaskId, ReduceTask)
+	//	c.append2Tasks(reduceTask)
+	//}
+
 	return nil
 }
 
@@ -87,13 +99,46 @@ func (c *Coordinator) Example(args *ExampleArgs, reply *ExampleReply) error {
 	return nil
 }
 
+func (c *Coordinator) deleteFromWorkingTasks(taskId int, taskType TaskType) *Task {
+	j := 0
+	var finishedTask *Task
+	for _, t := range c.workingTasks {
+		if t.TaskId == taskId && t.TaskType == taskType {
+			finishedTask = t
+		} else {
+			c.workingTasks[j] = t
+			j++
+		}
+	}
+	if finishedTask == nil {
+		log.Printf("There has no task with id %v\n", taskId)
+		// which means the specific task is done but files missing,
+		// so we rebuild one
+		finishedTask = c.TaskFactory(taskId, taskType)
+	} else {
+		c.workingTasks = c.workingTasks[:j]
+	}
+	finishedTask.Timer.Stop()
+	return finishedTask
+}
+
+func (c *Coordinator) append2Tasks(task *Task) {
+	for _, t := range c.tasks[task.TaskType] {
+		if t.TaskId == task.TaskId {
+			return
+		}
+	}
+	c.tasks[task.TaskType] = append(c.tasks[task.TaskType], task)
+}
+
 func (c *Coordinator) checkExpiredTask() {
 	count := 0
 	for _, t := range c.workingTasks {
 		select {
 		case <-t.Timer.C:
+			t.Timer.Stop()
 			// add back to tasks
-			c.tasks[t.TaskType] = append(c.tasks[t.TaskType], t)
+			c.append2Tasks(t)
 		default:
 			c.workingTasks[count] = t
 			count++
@@ -108,12 +153,12 @@ func (c *Coordinator) findAvailableTask(t TaskType, reply *NewTaskReply) {
 		switch t {
 		case MapTask:
 			c.stage = Reducing
-			c.buildReduceTasks()
-			log.Println("Map tasks are all done.")
+			c.buildTasks(ReduceTask)
+			log.Println("Map tasks finished.")
 			t = ReduceTask
 		case ReduceTask:
 			c.stage = EverythingOkay
-			log.Println("Finished all tasks. Quitting...")
+			log.Println("All tasks finished. Quitting...")
 			return
 		default:
 			log.Println("Unknown Task type when findAvailableTask: ", t)
@@ -121,7 +166,7 @@ func (c *Coordinator) findAvailableTask(t TaskType, reply *NewTaskReply) {
 	}
 	if len(c.tasks[t]) == 0 {
 		// no task in the task pool
-		reply.TaskType = NothingToDo
+		reply.TaskType = EmptyTask
 		return
 	}
 	// copy fields not ptr
@@ -134,7 +179,7 @@ func (c *Coordinator) findAvailableTask(t TaskType, reply *NewTaskReply) {
 	// start timing
 	targetTask.Timer.Reset(TaskTimeout)
 	c.workingTasks = append(c.workingTasks, targetTask)
-	log.Println("Task-", targetTask.TaskType, "-", targetTask.TaskId, " allocated.")
+	log.Printf("Task-%v-%v allocated.\n", targetTask.TaskType, targetTask.TaskId)
 	return
 }
 
@@ -172,6 +217,7 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	c := Coordinator{
 		nMap:         len(files),
 		nReduce:      nReduce,
+		files:        files,
 		tasks:        make(map[TaskType][]*Task),
 		workingTasks: make([]*Task, 0, MaxInt(len(files), nReduce)),
 		stage:        Mapping,
@@ -191,36 +237,40 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 		return nil
 	}
 
-	c.buildMapTasks(files)
+	c.buildTasks(MapTask)
 
 	c.server()
 	log.Println("Coordinator started.")
 	return &c
 }
 
-func (c *Coordinator) buildMapTasks(files []string) {
-	tasks := make([]*Task, len(files))
-	for i, file := range files {
-		tasks[i] = &Task{
-			TaskId:   i,
-			TaskType: MapTask,
-			Filename: file,
-			Timer:    time.NewTimer(TaskTimeout),
-		}
-		tasks[i].Timer.Stop()
+func (c *Coordinator) TaskFactory(taskId int, taskType TaskType) *Task {
+	var filename string
+	if taskType == MapTask {
+		filename = c.files[taskId]
 	}
-	c.tasks[MapTask] = tasks
+	return &Task{
+		TaskType: taskType,
+		TaskId:   taskId,
+		Filename: filename,
+		Timer:    time.NewTimer(TaskTimeout),
+	}
 }
 
-func (c *Coordinator) buildReduceTasks() {
-	tasks := make([]*Task, c.nReduce)
-	for i := 0; i < c.nReduce; i++ {
-		tasks[i] = &Task{
-			TaskId:   i,
-			TaskType: ReduceTask,
-			Timer:    time.NewTimer(TaskTimeout),
-		}
+func (c *Coordinator) buildTasks(taskType TaskType) {
+	var size int
+	switch taskType {
+	case MapTask:
+		size = c.nMap
+	case ReduceTask:
+		size = c.nReduce
+	default:
+		panic("unhandled default case")
+	}
+	tasks := make([]*Task, size)
+	for i := 0; i < size; i++ {
+		tasks[i] = c.TaskFactory(i, taskType)
 		tasks[i].Timer.Stop()
 	}
-	c.tasks[ReduceTask] = tasks
+	c.tasks[taskType] = tasks
 }

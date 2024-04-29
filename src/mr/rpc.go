@@ -31,7 +31,7 @@ type TaskType int
 const (
 	MapTask TaskType = iota
 	ReduceTask
-	NothingToDo
+	EmptyTask
 )
 
 type Task struct {
@@ -46,7 +46,10 @@ type MarkFinishedTaskRequest struct {
 	TaskId int
 }
 
-type NewTaskRequest struct {
+type HandleTaskErrRequest struct {
+	MapTaskId int
+	// ReduceTaskId >= 0 means reduce-task needs re-build
+	ReduceTaskId int
 }
 
 type NewTaskReply struct {
