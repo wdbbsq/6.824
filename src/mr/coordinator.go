@@ -34,20 +34,21 @@ type Coordinator struct {
 
 // Your code here -- RPC handlers for the worker to call.
 // alloc new Task to worker
-func (c *Coordinator) NewTask(_ *EmptyArgs, reply *NewTaskReply) error {
+func (c *Coordinator) NewTask(args *NewTaskRequest, reply *NewTaskReply) error {
 	c.lock.Lock()
 	defer c.lock.Unlock()
 
-	reply.NMap = c.nMap
-	reply.NReduce = c.nReduce
 	switch c.stage {
 	case Mapping:
-		c.findAvailableTask(MapTask, reply)
+		c.findAvailableTask(MapTask, args.WorkerId, reply)
 	case Reducing:
-		c.findAvailableTask(ReduceTask, reply)
+		c.findAvailableTask(ReduceTask, args.WorkerId, reply)
 	case EverythingOkay:
 		reply.TaskType = EmptyTask
 	}
+	reply.Stage = c.stage
+	reply.NMap = c.nMap
+	reply.NReduce = c.nReduce
 	return nil
 }
 
@@ -56,7 +57,13 @@ func (c *Coordinator) MarkFinishedTask(args *MarkFinishedTaskRequest, _ *EmptyAr
 	defer c.lock.Unlock()
 
 	finishedTask := c.deleteFromWorkingTasks(args.TaskId, args.TaskType)
-
+	if finishedTask == nil {
+		return nil
+	}
+	if args.WorkerId != finishedTask.WorkerId {
+		log.Printf("Get reply from expired worker %v\n", args.WorkerId)
+		return nil
+	}
 	// check expiration
 	select {
 	case <-finishedTask.Timer.C:
@@ -73,20 +80,26 @@ func (c *Coordinator) MarkFinishedTask(args *MarkFinishedTaskRequest, _ *EmptyAr
 // HandleTaskErr would reschedule working tasks
 // when map or reduce workers having trouble
 func (c *Coordinator) HandleTaskErr(args *HandleTaskErrRequest, _ *EmptyArgs) error {
-	//c.lock.Lock()
-	//defer c.lock.Unlock()
-	//
-	//// rebuild map task
-	//mapTask := c.deleteFromWorkingTasks(args.MapTaskId, MapTask)
-	//c.append2Tasks(mapTask)
-	//
-	//c.stage = Mapping
-	//
-	//if args.ReduceTaskId >= 0 {
-	//	// rebuild reduce task
-	//	reduceTask := c.deleteFromWorkingTasks(args.ReduceTaskId, ReduceTask)
-	//	c.append2Tasks(reduceTask)
-	//}
+	c.lock.Lock()
+	defer c.lock.Unlock()
+
+	// rebuild map task
+	mapTask := c.deleteFromWorkingTasks(args.MapTaskId, MapTask)
+	if mapTask == nil {
+		return nil
+	}
+	c.append2Tasks(mapTask)
+
+	c.stage = Mapping
+
+	if args.ReduceTaskId >= 0 {
+		// rebuild reduce task
+		reduceTask := c.deleteFromWorkingTasks(args.ReduceTaskId, ReduceTask)
+		if reduceTask == nil {
+			return nil
+		}
+		c.append2Tasks(reduceTask)
+	}
 
 	return nil
 }
@@ -114,11 +127,11 @@ func (c *Coordinator) deleteFromWorkingTasks(taskId int, taskType TaskType) *Tas
 		log.Printf("There has no task with id %v\n", taskId)
 		// which means the specific task is done but files missing,
 		// so we rebuild one
-		finishedTask = c.TaskFactory(taskId, taskType)
+		//finishedTask = c.TaskFactory(taskId, taskType)
 	} else {
 		c.workingTasks = c.workingTasks[:j]
+		finishedTask.Timer.Stop()
 	}
-	finishedTask.Timer.Stop()
 	return finishedTask
 }
 
@@ -147,18 +160,18 @@ func (c *Coordinator) checkExpiredTask() {
 	c.workingTasks = c.workingTasks[:count]
 }
 
-func (c *Coordinator) findAvailableTask(t TaskType, reply *NewTaskReply) {
+func (c *Coordinator) findAvailableTask(t TaskType, workerId int, reply *NewTaskReply) {
 	c.checkExpiredTask()
 	if len(c.tasks[t]) == 0 && len(c.workingTasks) == 0 {
 		switch t {
 		case MapTask:
 			c.stage = Reducing
 			c.buildTasks(ReduceTask)
-			log.Println("Map tasks finished.")
+			log.Println("#### Map tasks finished.")
 			t = ReduceTask
 		case ReduceTask:
 			c.stage = EverythingOkay
-			log.Println("All tasks finished. Quitting...")
+			log.Println("#### All tasks finished. Quitting...")
 			return
 		default:
 			log.Println("Unknown Task type when findAvailableTask: ", t)
@@ -169,17 +182,21 @@ func (c *Coordinator) findAvailableTask(t TaskType, reply *NewTaskReply) {
 		reply.TaskType = EmptyTask
 		return
 	}
-	// copy fields not ptr
 	targetTask := c.tasks[t][0]
+	targetTask.WorkerId = workerId
+
+	// copy fields not ptr
 	reply.TaskId = targetTask.TaskId
 	reply.TaskType = t
 	reply.Filename = targetTask.Filename
+
 	// delete targetTask from task pool
 	c.tasks[t] = c.tasks[t][1:]
+
 	// start timing
 	targetTask.Timer.Reset(TaskTimeout)
 	c.workingTasks = append(c.workingTasks, targetTask)
-	log.Printf("Task-%v-%v allocated.\n", targetTask.TaskType, targetTask.TaskId)
+	log.Printf("Task-%v-%v allocated to worker-%v\n", targetTask.TaskType, targetTask.TaskId, workerId)
 	return
 }
 
@@ -252,6 +269,7 @@ func (c *Coordinator) TaskFactory(taskId int, taskType TaskType) *Task {
 	return &Task{
 		TaskType: taskType,
 		TaskId:   taskId,
+		WorkerId: -1,
 		Filename: filename,
 		Timer:    time.NewTimer(TaskTimeout),
 	}

@@ -45,22 +45,25 @@ const (
 // main/mrworker.go calls this function.
 func Worker(mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
+	workerId := os.Getpid()
 	// to reuse workers
 	for {
 		reply := NewTaskReply{}
 		// todo consider add worker id to distinguish each other
-		if !call(NewTaskRpc, &EmptyArgs{}, &reply) {
+		if !call(NewTaskRpc, &NewTaskRequest{WorkerId: workerId}, &reply) {
 			log.Println("RPC call failed: ", NewTaskRpc, ", reply: ", reply)
 			return
 		}
 		switch reply.TaskType {
 		case MapTask:
-			doMap(mapf, reply)
+			doMap(mapf, reply, workerId)
 		case ReduceTask:
-			doReduce(reducef, reply)
+			doReduce(reducef, reply, workerId)
 		case EmptyTask:
-			log.Println("Worker got nothing to do, quit...")
-			return
+			log.Printf("Worker-%v got nothing to do\n", workerId)
+			if reply.Stage == EverythingOkay {
+				return
+			}
 		default:
 			log.Println("Unknown TaskType: ", reply.TaskType)
 		}
@@ -68,11 +71,11 @@ func Worker(mapf func(string, string) []KeyValue,
 	}
 }
 
-func doMap(mapf func(string, string) []KeyValue, t NewTaskReply) {
+func doMap(mapf func(string, string) []KeyValue, t NewTaskReply, workerId int) {
 	// read file
 	file, err := os.Open(t.Filename)
 	if err != nil {
-		log.Printf("MapWorker cannot open %v, %v\n", t.Filename, err.Error())
+		log.Printf("MapWorker-%v cannot open %v, %v\n", workerId, t.Filename, err.Error())
 		request := HandleTaskErrRequest{
 			MapTaskId:    t.TaskId,
 			ReduceTaskId: -1,
@@ -102,7 +105,6 @@ func doMap(mapf func(string, string) []KeyValue, t NewTaskReply) {
 		jsonFile, err := os.Create(filename)
 		if err != nil {
 			log.Printf("MapWorker cannot open %v, %v\n", filename, err.Error())
-
 			return
 		}
 		encoder := json.NewEncoder(jsonFile)
@@ -114,6 +116,7 @@ func doMap(mapf func(string, string) []KeyValue, t NewTaskReply) {
 	// inform coordinator
 	finishedTask := MarkFinishedTaskRequest{
 		TaskType: t.TaskType,
+		WorkerId: workerId,
 		TaskId:   t.TaskId,
 	}
 	if !call(MarkFinishedTask, &finishedTask, &EmptyArgs{}) {
@@ -121,7 +124,7 @@ func doMap(mapf func(string, string) []KeyValue, t NewTaskReply) {
 	}
 }
 
-func doReduce(reducef func(string, []string) string, t NewTaskReply) {
+func doReduce(reducef func(string, []string) string, t NewTaskReply, workerId int) {
 	defer func() {
 		// clean up tmp files
 	}()
@@ -132,14 +135,16 @@ func doReduce(reducef func(string, []string) string, t NewTaskReply) {
 		filename := fmt.Sprintf("./tmp/mr-%v-%v", i, t.TaskId)
 		file, err := os.Open(filename)
 		if err != nil {
-			log.Printf("ReduceWorker cannot open %v, %v\n", filename, err.Error())
+			log.Printf("ReduceWorker-%v cannot open %v, %v\n", workerId, filename, err.Error())
 			// inform coordinator err occurred
-			request := HandleTaskErrRequest{
-				MapTaskId:    i,
-				ReduceTaskId: t.TaskId,
-			}
-			call(TaskErrRpc, &request, &EmptyArgs{})
-			return
+			//request := HandleTaskErrRequest{
+			//	MapTaskId:    i,
+			//	ReduceTaskId: t.TaskId,
+			//}
+			//call(TaskErrRpc, &request, &EmptyArgs{})
+
+			// ignore reduce map error as the MapReduce paper suggested
+			continue
 		}
 		defer file.Close()
 		decoder := json.NewDecoder(file)
@@ -176,6 +181,7 @@ func doReduce(reducef func(string, []string) string, t NewTaskReply) {
 	// inform coordinator
 	finishedTask := MarkFinishedTaskRequest{
 		TaskType: t.TaskType,
+		WorkerId: workerId,
 		TaskId:   t.TaskId,
 	}
 	if !call(MarkFinishedTask, &finishedTask, &EmptyArgs{}) {

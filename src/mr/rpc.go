@@ -36,26 +36,35 @@ const (
 
 type Task struct {
 	TaskType
-	TaskId   int
+	TaskId int
+	// current worker id
+	WorkerId int
 	Filename string
 	Timer    *time.Timer
 }
 
 type MarkFinishedTaskRequest struct {
 	TaskType
-	TaskId int
+	WorkerId int
+	TaskId   int
 }
 
 type HandleTaskErrRequest struct {
 	MapTaskId int
 	// ReduceTaskId >= 0 means reduce-task needs re-build
 	ReduceTaskId int
+	WorkerId     int
+}
+
+type NewTaskRequest struct {
+	WorkerId int
 }
 
 type NewTaskReply struct {
 	TaskType
 	TaskId   int
 	Filename string
+	Stage    stage
 	NMap     int
 	NReduce  int
 }

@@ -32,6 +32,36 @@ failed_any=0
 
 
 #########################################################
+echo '***' Starting map parallelism test.
+
+rm -f mr-*
+
+timeout -k 2s 180s ../mrcoordinator ../pg*txt &
+sleep 1
+
+timeout -k 2s 180s ../mrworker ../../mrapps/mtiming.so &
+timeout -k 2s 180s ../mrworker ../../mrapps/mtiming.so
+
+NT=`cat mr-out* | grep '^times-' | wc -l | sed 's/ //g'`
+if [ "$NT" != "2" ]
+then
+  echo '---' saw "$NT" workers rather than 2
+  echo '---' map parallelism test: FAIL
+  failed_any=1
+fi
+
+if cat mr-out* | grep '^parallel.* 2' > /dev/null
+then
+  echo '---' map parallelism test: PASS
+else
+  echo '---' map workers did not run in parallel
+  echo '---' map parallelism test: FAIL
+  failed_any=1
+fi
+
+wait
+
+#########################################################
 # test whether any worker or coordinator exits before the
 # task has completed (i.e., all output files have been finalized)
 rm -f mr-*
