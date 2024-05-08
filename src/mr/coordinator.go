@@ -85,20 +85,18 @@ func (c *Coordinator) HandleTaskErr(args *HandleTaskErrRequest, _ *EmptyArgs) er
 
 	// rebuild map task
 	mapTask := c.deleteFromWorkingTasks(args.MapTaskId, MapTask)
-	if mapTask == nil {
-		return nil
+	if mapTask != nil {
+		c.append2Tasks(mapTask)
 	}
-	c.append2Tasks(mapTask)
 
 	c.stage = Mapping
 
 	if args.ReduceTaskId >= 0 {
-		// rebuild reduce task
+		// rebuild all working reduce task
 		reduceTask := c.deleteFromWorkingTasks(args.ReduceTaskId, ReduceTask)
-		if reduceTask == nil {
-			return nil
+		if reduceTask != nil {
+			c.append2Tasks(reduceTask)
 		}
-		c.append2Tasks(reduceTask)
 	}
 
 	return nil
