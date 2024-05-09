@@ -38,7 +38,10 @@ const (
 	Leader
 )
 
-const HeartbeatInterval = 100 * time.Millisecond
+const (
+	HeartbeatInterval = 100 * time.Millisecond
+	RequestTimout
+)
 
 // as each Raft peer becomes aware that successive log entries are
 // committed, the peer should send an ApplyMsg to the service (or
@@ -172,18 +175,22 @@ type RequestVoteReply struct {
 // example RequestVote RPC handler.
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
+	reply.Term = rf.currentTerm
 	if args.Term < rf.currentTerm {
 		reply.VoteGranted = false
 		return
 	}
+	if args.Term > rf.currentTerm {
+		rf.currentTerm = args.Term
+		atomic.StoreInt32(&rf.state, Follower)
+	}
 	// vote for nobody or candidate's log is up-to-date
 	if rf.votedFor == -1 {
 		//(args.LastLogTerm == rf.currentTerm && args.LastLogIndex == rf.commitIndex) {
-		reply.Term = rf.currentTerm
 		reply.VoteGranted = true
-		return
+	} else {
+		reply.VoteGranted = false
 	}
-	reply.VoteGranted = false
 }
 
 type AppendEntriesArgs struct {
@@ -203,14 +210,16 @@ type AppendEntriesReply struct {
 // AppendEntries send heartbeats periodically by leader
 // when logEntry is empty
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	reply.Term = rf.currentTerm
 	if args.Term < rf.currentTerm {
 		reply.Success = false
 		return
 	}
-	if len(rf.log) < args.PrevLogIndex {
-		reply.Success = false
-		return
-	}
+	//if args.Term > rf.currentTerm {
+	//	rf.currentTerm = args.Term
+	//	reply.Term = args.Term
+	//	atomic.StoreInt32(&rf.state, Follower)
+	//}
 	// receive a heartbeat
 	if args.Entries == nil || len(args.Entries) == 0 {
 		rf.resetTimer()
@@ -227,7 +236,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		default:
 		}
 
-		reply.Term = rf.currentTerm
 		reply.Success = true
 		return
 	}
@@ -261,9 +269,24 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 // capitalized all field names in structs passed over RPC, and
 // that the caller passes the address of the reply struct with &, not
 // the struct itself.
-func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
-	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
-	return ok
+func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply,
+	group *sync.WaitGroup, voteCh chan bool) {
+	defer group.Done()
+
+	okCh := make(chan bool)
+	defer close(okCh)
+	go func() {
+		okCh <- rf.peers[server].Call("Raft.RequestVote", args, reply)
+	}()
+
+	select {
+	case ok := <-okCh:
+		if ok && reply.VoteGranted {
+			voteCh <- true
+		}
+	case <-time.After(RequestTimout):
+		log.Printf("RequestVote for %v timeout\n", rf.me)
+	}
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
@@ -313,7 +336,7 @@ func (rf *Raft) killed() bool {
 }
 
 // The ticker go routine starts a new election if this peer hasn't received
-// heartsbeats recently.
+// heartbeats recently.
 func (rf *Raft) ticker() {
 	for rf.killed() == false {
 
@@ -322,56 +345,54 @@ func (rf *Raft) ticker() {
 		// time.Sleep().
 		select {
 		case <-rf.timer.C:
-			// todo consider smaller range of lock
-			rf.mu.Lock()
-			// timeout
-			rf.resetTimer()
-
-			rf.currentTerm++
-
 			// start an election
-			atomic.StoreInt32(&rf.state, Candidate)
+			rf.mu.Lock()
+			rf.resetTimer()
+			rf.currentTerm++
 			// vote for myself first
 			rf.votedFor = rf.me
+			// release lock first
+			rf.mu.Unlock()
 
-			voter := 0
-			// todo send in parallel
+			atomic.StoreInt32(&rf.state, Candidate)
+
+			log.Printf("Server %v-%v started an election\n", rf.me, rf.currentTerm)
+
+			voteCh := make(chan bool, len(rf.peers))
+			group := &sync.WaitGroup{}
+
 			for i := 0; i < len(rf.peers); i++ {
 				if i == rf.me {
 					continue
 				}
-				reply := &RequestVoteReply{}
-				if !rf.sendRequestVote(i, &RequestVoteArgs{
+				group.Add(1)
+				go rf.sendRequestVote(i, &RequestVoteArgs{
 					Term:        rf.currentTerm,
 					CandidateId: rf.me,
-				}, reply) {
-					log.Println("Err when sending RequestVote")
-				}
-				if reply.VoteGranted {
-					voter++
-				}
+				}, &RequestVoteReply{}, group, voteCh)
 			}
+			group.Wait()
+
 			// leader now!
-			if voter > len(rf.peers)/2 {
+			if len(voteCh) > len(rf.peers)/2 {
 				atomic.StoreInt32(&rf.state, Leader)
+				log.Printf("Leader: %v-%v\n", rf.me, rf.currentTerm)
 			}
-			rf.mu.Unlock()
+			close(voteCh)
 		}
 	}
 }
 
 func (rf *Raft) heartbeat() {
-	for rf.killed() == false {
-		if atomic.LoadInt32(&rf.state) == Leader {
-			for i := 0; i < len(rf.peers); i++ {
-				reply := &AppendEntriesReply{}
-				if !rf.sendAppendEntries(i, &AppendEntriesArgs{
-					Term:     rf.currentTerm,
-					LeaderId: rf.me,
-					Entries:  nil,
-				}, reply) {
-					log.Println("Err when sending AppendEntries")
-				}
+	for rf.killed() == false && atomic.LoadInt32(&rf.state) == Leader {
+		for i := 0; i < len(rf.peers); i++ {
+			reply := &AppendEntriesReply{}
+			if !rf.sendAppendEntries(i, &AppendEntriesArgs{
+				Term:     rf.currentTerm,
+				LeaderId: rf.me,
+				Entries:  nil,
+			}, reply) {
+				log.Println("Err when sending AppendEntries")
 			}
 		}
 		time.Sleep(HeartbeatInterval)
@@ -382,7 +403,8 @@ func (rf *Raft) resetTimer() {
 	// raft paper suggests 150-300 ms
 	// 6.824: Such a range only makes sense if the leader sends
 	// heartbeats considerably more often than once per 150 milliseconds.
-	// So a larger range is suggested (300-450)
+	// So a larger range is suggested (300-
+	rf.timer.Stop()
 	timeout := rf.random.Intn(150) + 300
 	rf.timer.Reset(time.Duration(timeout) * time.Millisecond)
 }
@@ -417,7 +439,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	atomic.StoreInt32(&rf.state, Follower)
 	rf.random = rand.New(rand.NewSource(time.Now().UnixNano()))
 	rf.timer = time.NewTimer(time.Minute)
-	rf.resetTimer()
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
@@ -426,6 +447,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	go rf.ticker()
 
 	go rf.heartbeat()
+
+	rf.resetTimer()
 
 	return rf
 }
