@@ -29,8 +29,6 @@ import (
 	"6.824/labrpc"
 )
 
-var random *rand.Rand
-
 // use *type alias* instead of custome type
 type State = int32
 
@@ -81,7 +79,6 @@ type Raft struct {
 	// state a Raft server must maintain.
 	currentTerm int
 	votedFor    int
-	isLeader    bool
 	log         []LogEntry
 
 	commitIndex int
@@ -90,15 +87,16 @@ type Raft struct {
 	nextIndex  []int
 	matchIndex []int
 
-	timer *time.Timer
-	state State
+	timer  *time.Timer
+	state  State
+	random *rand.Rand
 }
 
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
 	// Your code here (2A).
-	return rf.currentTerm, rf.isLeader
+	return rf.currentTerm, atomic.LoadInt32(&rf.state) == Leader
 }
 
 // save Raft's persistent state to stable storage,
@@ -214,16 +212,19 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 	// receive a heartbeat
-	if len(args.Entries) == 0 {
+	if args.Entries == nil || len(args.Entries) == 0 {
 		rf.resetTimer()
 
-		switch rf.state {
-		// we lost qaq
+		switch atomic.LoadInt32(&rf.state) {
 		case Candidate:
-			rf.currentTerm = args.Term
-		// our place has been stolen
+			// we lost qaq
+			if args.Term >= rf.currentTerm {
+				atomic.StoreInt32(&rf.state, Follower)
+				rf.currentTerm = args.Term
+			}
 		case Leader:
-
+			rf.currentTerm = args.Term
+		default:
 		}
 
 		reply.Term = rf.currentTerm
@@ -321,8 +322,11 @@ func (rf *Raft) ticker() {
 		// time.Sleep().
 		select {
 		case <-rf.timer.C:
-			// timeout, reset timer
+			// todo consider smaller range of lock
+			rf.mu.Lock()
+			// timeout
 			rf.resetTimer()
+
 			rf.currentTerm++
 
 			// start an election
@@ -351,34 +355,35 @@ func (rf *Raft) ticker() {
 			if voter > len(rf.peers)/2 {
 				atomic.StoreInt32(&rf.state, Leader)
 			}
+			rf.mu.Unlock()
 		}
 	}
 }
 
 func (rf *Raft) heartbeat() {
-	for rf.killed() == false && atomic.LoadInt32(&rf.state) == Leader {
-		for i := 0; i < len(rf.peers); i++ {
-			reply := &AppendEntriesReply{}
-			if !rf.sendAppendEntries(i, &AppendEntriesArgs{
-				Term:     rf.currentTerm,
-				LeaderId: rf.me,
-				Entries:  nil,
-			}, reply) {
-				log.Println("Err when sending AppendEntries")
+	for rf.killed() == false {
+		if atomic.LoadInt32(&rf.state) == Leader {
+			for i := 0; i < len(rf.peers); i++ {
+				reply := &AppendEntriesReply{}
+				if !rf.sendAppendEntries(i, &AppendEntriesArgs{
+					Term:     rf.currentTerm,
+					LeaderId: rf.me,
+					Entries:  nil,
+				}, reply) {
+					log.Println("Err when sending AppendEntries")
+				}
 			}
-
 		}
 		time.Sleep(HeartbeatInterval)
 	}
 }
 
 func (rf *Raft) resetTimer() {
-	// todo lock?
 	// raft paper suggests 150-300 ms
 	// 6.824: Such a range only makes sense if the leader sends
 	// heartbeats considerably more often than once per 150 milliseconds.
 	// So a larger range is suggested (300-450)
-	timeout := random.Intn(150) + 300
+	timeout := rf.random.Intn(150) + 300
 	rf.timer.Reset(time.Duration(timeout) * time.Millisecond)
 }
 
@@ -401,7 +406,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// Your initialization code here (2A, 2B, 2C).
 	rf.currentTerm = 0
 	rf.votedFor = -1
-	rf.isLeader = false
 	rf.log = make([]LogEntry, 0)
 
 	rf.commitIndex = 0
@@ -410,8 +414,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.nextIndex = make([]int, 0)
 	rf.matchIndex = make([]int, 0)
 
-	rf.state = Follower
-	random = rand.New(rand.NewSource(time.Now().UnixNano()))
+	atomic.StoreInt32(&rf.state, Follower)
+	rf.random = rand.New(rand.NewSource(time.Now().UnixNano()))
 	rf.timer = time.NewTimer(time.Minute)
 	rf.resetTimer()
 
