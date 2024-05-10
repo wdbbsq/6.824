@@ -18,8 +18,6 @@ package raft
 //
 
 import (
-	"context"
-	"log"
 	"math/rand"
 	"time"
 	//	"bytes"
@@ -81,7 +79,7 @@ type Raft struct {
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
-	currentTerm int
+	currentTerm uint64
 	votedFor    int
 	log         []LogEntry
 
@@ -100,7 +98,23 @@ type Raft struct {
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
 	// Your code here (2A).
-	return rf.currentTerm, atomic.LoadInt32(&rf.state) == Leader
+	return int(rf.GetCurrentTerm()), rf.AmI(Leader)
+}
+
+func (rf *Raft) GetCurrentTerm() uint64 {
+	return atomic.LoadUint64(&rf.currentTerm)
+}
+
+func (rf *Raft) SetCurrentTerm(x uint64) {
+	atomic.StoreUint64(&rf.currentTerm, x)
+}
+
+func (rf *Raft) AmI(somebody State) bool {
+	return atomic.LoadInt32(&rf.state) == somebody
+}
+
+func (rf *Raft) Become(somebody State) {
+	atomic.StoreInt32(&rf.state, somebody)
 }
 
 // save Raft's persistent state to stable storage,
@@ -159,7 +173,7 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 // field names must start with capital letters!
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
-	Term         int
+	Term         uint64
 	CandidateId  int
 	LastLogIndex int
 	LastLogTerm  int
@@ -169,21 +183,21 @@ type RequestVoteArgs struct {
 // field names must start with capital letters!
 type RequestVoteReply struct {
 	// Your data here (2A).
-	Term        int
+	Term        uint64
 	VoteGranted bool
 }
 
 // example RequestVote RPC handler.
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
-	reply.Term = rf.currentTerm
-	if args.Term < rf.currentTerm {
+	reply.Term = rf.GetCurrentTerm()
+	if args.Term < rf.GetCurrentTerm() {
 		reply.VoteGranted = false
 		return
 	}
-	if args.Term > rf.currentTerm {
-		rf.currentTerm = args.Term
-		atomic.StoreInt32(&rf.state, Follower)
+	if args.Term > rf.GetCurrentTerm() {
+		rf.SetCurrentTerm(args.Term)
+		rf.Become(Follower)
 	}
 	// vote for nobody or candidate's log is up-to-date
 	if rf.votedFor == -1 {
@@ -195,35 +209,35 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 }
 
 type AppendEntriesArgs struct {
-	Term         int
+	Term         uint64
 	LeaderId     int
 	PrevLogIndex int
-	PrevLogTerm  int
+	PrevLogTerm  uint64
 	Entries      []LogEntry
 	LeaderCommit int
 }
 
 type AppendEntriesReply struct {
-	Term    int
+	Term    uint64
 	Success bool
 }
 
 // AppendEntries send heartbeats periodically by leader
 // when logEntry is empty
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
-	reply.Term = rf.currentTerm
-	if args.Term < rf.currentTerm {
+	reply.Term = rf.GetCurrentTerm()
+	if args.Term < rf.GetCurrentTerm() {
 		reply.Success = false
 		return
 	}
 	// receive a heartbeat
 	if args.Entries == nil || len(args.Entries) == 0 {
 		rf.resetTimer()
-		if args.Term > rf.currentTerm {
-			rf.currentTerm = args.Term
-			atomic.StoreInt32(&rf.state, Follower)
+		if args.Term > rf.GetCurrentTerm() {
+			rf.SetCurrentTerm(args.Term)
+			rf.Become(Follower)
 		}
-		log.Printf("%v-%v get heartbeat from %v-%v\n", rf.me, rf.currentTerm,
+		DPrintf("%v-%v get heartbeat from %v-%v\n", rf.me, rf.GetCurrentTerm(),
 			args.LeaderId, args.Term)
 
 		//switch atomic.LoadInt32(&rf.state) {
@@ -277,42 +291,11 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	group *sync.WaitGroup, voteCh chan bool) {
 
 	defer group.Done()
-	ctx, cancel := context.WithTimeout(context.Background(), RequestTimout)
-	defer cancel()
 
-	select {
-	case voteCh <- rf.peers[server].Call("Raft.RequestVote", args, reply):
-	case <-ctx.Done():
-		log.Printf("RequestVote for %v timeout\n", rf.me)
-	}
-}
-
-func (rf *Raft) sendRpcRequest(server int, method string, args interface{}, reply interface{},
-	group *sync.WaitGroup, resultCh chan interface{}) {
-
-	defer group.Done()
-
-	ok := rf.peers[server].Call(method, args, reply)
+	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
 	if ok {
-		resultCh <- reply
+		voteCh <- reply.VoteGranted
 	}
-
-	//ctx, cancel := context.WithTimeout(context.Background(), RequestTimout)
-	//defer cancel()
-	//okCh := make(chan bool)
-	//defer close(okCh)
-	//go func() {
-	//	okCh <- rf.peers[server].Call(method, args, reply)
-	//}()
-	//
-	//select {
-	//case ok := <-okCh:
-	//	if ok {
-	//		resultCh <- reply
-	//	}
-	//case <-ctx.Done():
-	//	DPrintf("RequestVote for %v timeout\n", rf.me)
-	//}
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
@@ -375,17 +358,18 @@ func (rf *Raft) ticker() {
 			// start an election
 			rf.mu.Lock()
 			rf.resetTimer()
-			rf.currentTerm++
 			// vote for myself first
 			rf.votedFor = rf.me
 			// release lock first
 			rf.mu.Unlock()
 
-			atomic.StoreInt32(&rf.state, Candidate)
+			atomic.AddUint64(&rf.currentTerm, 1)
+			rf.Become(Candidate)
 
-			DPrintf("Server %v-%v started an election\n", rf.me, rf.currentTerm)
+			DPrintf("Server %v-%v started an election\n", rf.me, rf.GetCurrentTerm())
 
-			voteCh := make(chan interface{}, len(rf.peers))
+			var votes int32
+			votes = 1
 			group := &sync.WaitGroup{}
 
 			for i := 0; i < len(rf.peers); i++ {
@@ -393,47 +377,62 @@ func (rf *Raft) ticker() {
 					continue
 				}
 				group.Add(1)
-				go rf.sendRpcRequest(i, "Raft.RequestVote", &RequestVoteArgs{
-					Term:        rf.currentTerm,
-					CandidateId: rf.me,
-				}, &RequestVoteReply{}, group, voteCh)
+				go func(i int) {
+					defer group.Done()
+					reply := &RequestVoteReply{}
+					// Call() is guaranteed to return,
+					// so there's no need to handle timeout ourselves
+					ok := rf.peers[i].Call("Raft.RequestVote", &RequestVoteArgs{
+						Term:        rf.GetCurrentTerm(),
+						CandidateId: rf.me,
+					}, reply)
+					if ok {
+						if reply.Term > rf.GetCurrentTerm() {
+							rf.Become(Follower)
+							DPrintf("meet bigger term...\n")
+							return
+						}
+						if reply.VoteGranted {
+							atomic.AddInt32(&votes, 1)
+							DPrintf("%v got %v\n", rf.me, i)
+						}
+					} else {
+						DPrintf("%v fail to RequestVote with %v\n", rf.me, i)
+					}
+				}(i)
 			}
 			group.Wait()
 
-			votes := 0
-			for reply := range voteCh {
-				if reply.(*RequestVoteReply).VoteGranted {
-					votes++
-				}
-			}
+			DPrintf("%v's total votes: %v\n", rf.me, votes)
+
 			// leader now!
-			if votes > len(rf.peers)/2 {
-				atomic.StoreInt32(&rf.state, Leader)
-				DPrintf("Leader: %v-%v\n", rf.me, rf.currentTerm)
+			if !rf.AmI(Follower) && int(votes) > len(rf.peers)/2 {
+				rf.Become(Leader)
+				DPrintf("Leader: %v-%v\n", rf.me, rf.GetCurrentTerm())
 			}
-			close(voteCh)
 		}
 	}
 }
 
 func (rf *Raft) heartbeat() {
 	for rf.killed() == false {
-		for atomic.LoadInt32(&rf.state) == Leader {
+		for rf.AmI(Leader) {
 			DPrintf("%v-%v sending heartbeat\n", rf.me, rf.currentTerm)
 			for i := 0; i < len(rf.peers); i++ {
-				reply := &AppendEntriesReply{}
-				if !rf.sendAppendEntries(i, &AppendEntriesArgs{
-					Term:     rf.currentTerm,
-					LeaderId: rf.me,
-					Entries:  nil,
-				}, reply) {
-					log.Println("Err when sending AppendEntries")
-				}
-				if reply.Term > rf.currentTerm {
-					rf.currentTerm = reply.Term
-					atomic.StoreInt32(&rf.state, Follower)
-					break
-				}
+				go func(i int) {
+					reply := &AppendEntriesReply{}
+					ok := rf.peers[i].Call("Raft.AppendEntries", &AppendEntriesArgs{
+						Term:     rf.GetCurrentTerm(),
+						LeaderId: rf.me,
+						Entries:  nil,
+					}, reply)
+					if ok {
+						if reply.Term > rf.GetCurrentTerm() {
+							rf.SetCurrentTerm(reply.Term)
+							rf.Become(Follower)
+						}
+					}
+				}(i)
 			}
 			time.Sleep(HeartbeatInterval)
 		}
@@ -477,7 +476,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.nextIndex = make([]int, 0)
 	rf.matchIndex = make([]int, 0)
 
-	atomic.StoreInt32(&rf.state, Follower)
+	rf.Become(Follower)
 	rf.random = rand.New(rand.NewSource(time.Now().UnixNano()))
 	rf.timer = time.NewTimer(time.Minute)
 
