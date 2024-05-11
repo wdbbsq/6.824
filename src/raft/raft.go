@@ -80,7 +80,7 @@ type Raft struct {
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 	currentTerm uint64
-	votedFor    int
+	votedFor    int64
 	log         []LogEntry
 
 	commitIndex int
@@ -89,9 +89,10 @@ type Raft struct {
 	nextIndex  []int
 	matchIndex []int
 
-	timer  *time.Timer
-	state  State
-	random *rand.Rand
+	timer    *time.Timer
+	state    State
+	random   *rand.Rand
+	randLock sync.Mutex
 }
 
 // return currentTerm and whether this server
@@ -109,11 +110,22 @@ func (rf *Raft) SetCurrentTerm(x uint64) {
 	atomic.StoreUint64(&rf.currentTerm, x)
 }
 
+func (rf *Raft) GetVoteFor() int64 {
+	return atomic.LoadInt64(&rf.votedFor)
+}
+
+func (rf *Raft) SetVoteFor(x int64) {
+	atomic.StoreInt64(&rf.votedFor, x)
+}
+
 func (rf *Raft) AmI(somebody State) bool {
 	return atomic.LoadInt32(&rf.state) == somebody
 }
 
 func (rf *Raft) Become(somebody State) {
+	if somebody == Follower {
+		rf.SetVoteFor(-1)
+	}
 	atomic.StoreInt32(&rf.state, somebody)
 }
 
@@ -196,11 +208,13 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		return
 	}
 	if args.Term > rf.GetCurrentTerm() {
+		rf.mu.Lock()
 		rf.SetCurrentTerm(args.Term)
 		rf.Become(Follower)
+		rf.mu.Unlock()
 	}
 	// vote for nobody or candidate's log is up-to-date
-	if rf.votedFor == -1 {
+	if rf.GetVoteFor() == -1 {
 		//(args.LastLogTerm == rf.currentTerm && args.LastLogIndex == rf.commitIndex) {
 		reply.VoteGranted = true
 	} else {
@@ -234,27 +248,14 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if args.Entries == nil || len(args.Entries) == 0 {
 		rf.resetTimer()
 		if args.Term > rf.GetCurrentTerm() {
-			rf.SetCurrentTerm(args.Term)
+			rf.mu.Lock()
 			rf.Become(Follower)
+			DPrintf("%v-%v back to a Follower", rf.me, rf.GetCurrentTerm())
+			rf.SetCurrentTerm(args.Term)
+			rf.mu.Unlock()
 		}
 		DPrintf("%v-%v get heartbeat from %v-%v\n", rf.me, rf.GetCurrentTerm(),
 			args.LeaderId, args.Term)
-
-		//switch atomic.LoadInt32(&rf.state) {
-		//case Candidate:
-		//	// we lost qaq
-		//	if args.Term >= rf.currentTerm {
-		//		atomic.StoreInt32(&rf.state, Follower)
-		//		rf.currentTerm = args.Term
-		//	}
-		//case Leader:
-		//	if args.Term > rf.currentTerm {
-		//		rf.currentTerm = args.Term
-		//	}
-		//	//rf.currentTerm = args.Term
-		//default:
-		//}
-
 		return
 	}
 
@@ -296,12 +297,6 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	if ok {
 		voteCh <- reply.VoteGranted
 	}
-}
-
-func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
-	// todo handle timeout
-	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
-	return ok
 }
 
 // the service using Raft (e.g. a k/v server) wants to start
@@ -359,24 +354,43 @@ func (rf *Raft) ticker() {
 			rf.mu.Lock()
 			rf.resetTimer()
 			// vote for myself first
-			rf.votedFor = rf.me
-			// release lock first
-			rf.mu.Unlock()
-
+			rf.SetVoteFor(int64(rf.me))
 			atomic.AddUint64(&rf.currentTerm, 1)
 			rf.Become(Candidate)
+
+			rf.mu.Unlock()
 
 			DPrintf("Server %v-%v started an election\n", rf.me, rf.GetCurrentTerm())
 
 			var votes int32
 			votes = 1
 			group := &sync.WaitGroup{}
+			stopCh := make(chan struct{})
+
+			// start a goroutine to watch votes
+			go func() {
+				for {
+					select {
+					case <-stopCh:
+						DPrintf("%v-%v's total votes: %v\n", rf.me, rf.GetCurrentTerm(), atomic.LoadInt32(&votes))
+						return
+					default:
+						if rf.AmI(Candidate) && atomic.LoadInt32(&votes) > int32(len(rf.peers)/2) {
+							rf.mu.Lock()
+							rf.Become(Leader)
+							rf.mu.Unlock()
+							DPrintf("Leader: %v-%v\n", rf.me, rf.GetCurrentTerm())
+						}
+					}
+				}
+			}()
 
 			for i := 0; i < len(rf.peers); i++ {
 				if i == rf.me {
 					continue
 				}
 				group.Add(1)
+				// do rpc request in parallel
 				go func(i int) {
 					defer group.Done()
 					reply := &RequestVoteReply{}
@@ -387,13 +401,22 @@ func (rf *Raft) ticker() {
 						CandidateId: rf.me,
 					}, reply)
 					if ok {
+						if !rf.AmI(Candidate) {
+							return
+						}
 						if reply.Term > rf.GetCurrentTerm() {
+							rf.mu.Lock()
 							rf.Become(Follower)
-							DPrintf("meet bigger term...\n")
+							atomic.StoreInt32(&votes, -(int32(len(rf.peers))))
+							rf.mu.Unlock()
+							DPrintf("%v-%v meet bigger term, back to Follower\n", rf.me, rf.GetCurrentTerm())
 							return
 						}
 						if reply.VoteGranted {
+							rf.mu.Lock()
+							//votes++
 							atomic.AddInt32(&votes, 1)
+							rf.mu.Unlock()
 							DPrintf("%v got %v\n", rf.me, i)
 						}
 					} else {
@@ -402,22 +425,17 @@ func (rf *Raft) ticker() {
 				}(i)
 			}
 			group.Wait()
-
-			DPrintf("%v's total votes: %v\n", rf.me, votes)
-
-			// leader now!
-			if !rf.AmI(Follower) && int(votes) > len(rf.peers)/2 {
-				rf.Become(Leader)
-				DPrintf("Leader: %v-%v\n", rf.me, rf.GetCurrentTerm())
-			}
+			stopCh <- struct{}{}
+			close(stopCh)
 		}
 	}
+	DPrintf("%v-%v quit ticker.\n", rf.me, rf.GetCurrentTerm())
 }
 
 func (rf *Raft) heartbeat() {
 	for rf.killed() == false {
 		for rf.AmI(Leader) {
-			DPrintf("%v-%v sending heartbeat\n", rf.me, rf.currentTerm)
+			DPrintf("%v-%v sending heartbeat\n", rf.me, rf.GetCurrentTerm())
 			for i := 0; i < len(rf.peers); i++ {
 				go func(i int) {
 					reply := &AppendEntriesReply{}
@@ -428,8 +446,10 @@ func (rf *Raft) heartbeat() {
 					}, reply)
 					if ok {
 						if reply.Term > rf.GetCurrentTerm() {
+							rf.mu.Lock()
 							rf.SetCurrentTerm(reply.Term)
 							rf.Become(Follower)
+							rf.mu.Unlock()
 						}
 					}
 				}(i)
@@ -437,16 +457,19 @@ func (rf *Raft) heartbeat() {
 			time.Sleep(HeartbeatInterval)
 		}
 	}
+	DPrintf("%v-%v quit heartbeat.\n", rf.me, rf.GetCurrentTerm())
 }
 
 func (rf *Raft) resetTimer() {
 	// raft paper suggests 150-300 ms
 	// 6.824: Such a range only makes sense if the leader sends
 	// heartbeats considerably more often than once per 150 milliseconds.
-	// So a larger range is suggested (300-
+	// So a larger range is suggested (300-450)
 	rf.timer.Stop()
-	timeout := rf.random.Intn(150) + 300
-	rf.timer.Reset(time.Duration(timeout) * time.Millisecond)
+	//rf.randLock.Lock()
+	//timeout := rf.random.Intn(150) + 300
+	//rf.randLock.Unlock()
+	rf.timer.Reset(time.Duration(rand.Intn(150)+300) * time.Millisecond)
 }
 
 // the service or tester wants to create a Raft server. the ports
@@ -466,8 +489,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
-	rf.currentTerm = 0
-	rf.votedFor = -1
+	rf.SetCurrentTerm(0)
+	rf.SetVoteFor(-1)
 	rf.log = make([]LogEntry, 0)
 
 	rf.commitIndex = 0
@@ -478,6 +501,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	rf.Become(Follower)
 	rf.random = rand.New(rand.NewSource(time.Now().UnixNano()))
+	rf.randLock = sync.Mutex{}
 	rf.timer = time.NewTimer(time.Minute)
 
 	// initialize from state persisted before a crash
