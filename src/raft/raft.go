@@ -39,8 +39,8 @@ const (
 )
 
 const (
-	HeartbeatInterval = 100 * time.Millisecond
-	RequestTimout
+	HeartbeatInterval    = 100 * time.Millisecond
+	ElectionTimeoutRange = 100
 )
 
 // as each Raft peer becomes aware that successive log entries are
@@ -90,10 +90,9 @@ type Raft struct {
 	nextIndex  []int
 	matchIndex []int
 
-	timer  *time.Timer
-	state  State
-	random *rand.Rand
-	//randLock             sync.Mutex
+	timer                *time.Timer
+	state                State
+	random               *rand.Rand
 	stopLeaderElectionCh chan struct{}
 }
 
@@ -209,6 +208,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		reply.VoteGranted = false
 		return
 	} else if args.Term > t {
+		// stop leader election
 		if atomic.LoadInt32(&rf.state) == Candidate {
 			rf.stopLeaderElectionCh <- struct{}{}
 		}
@@ -238,7 +238,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 type AppendEntriesArgs struct {
 	Term         uint64
-	LeaderId     int
+	LeaderId     int64
 	PrevLogIndex int
 	PrevLogTerm  uint64
 	Entries      []LogEntry
@@ -349,7 +349,7 @@ func (rf *Raft) Kill() {
 	defer rf.mu.Unlock()
 	atomic.StoreInt32(&rf.dead, 1)
 	// Your code here, if desired.
-	close(rf.stopLeaderElectionCh)
+	//close(rf.stopLeaderElectionCh)
 }
 
 func (rf *Raft) killed() bool {
@@ -365,16 +365,8 @@ func (rf *Raft) ticker() {
 		// Your code here to check if a leader election should
 		// be started and to randomize sleeping time using
 		// time.Sleep().
-		select {
-		case <-rf.timer.C:
-			rf.leaderElection()
-			//switch atomic.LoadInt32(&rf.state) {
-			//case Candidate:
-			//	rf.leaderElection()
-			//case Follower:
-			//	if
-			//}
-		}
+		<-rf.timer.C
+		rf.leaderElection()
 	}
 	DPrintf("%v-%v quit ticker.\n", rf.me, rf.GetCurrentTerm())
 }
@@ -395,14 +387,19 @@ func (rf *Raft) leaderElection() {
 
 	var votes int32
 	votes = 1
-	group := &sync.WaitGroup{}
+	group := sync.WaitGroup{}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
 	// start a goroutine to watch votes
 	go func() {
 		for {
 			select {
 			case <-rf.stopLeaderElectionCh:
-				DPrintf("%v-%v's total votes: %v\n", rf.me, rf.GetCurrentTerm(), atomic.LoadInt32(&votes))
+				cancel()
+				return
+			case <-ctx.Done():
+				DPrintf("Quit LE, %v-%v's total votes: %v\n", rf.me, rf.GetCurrentTerm(), atomic.LoadInt32(&votes))
 				return
 			default:
 				if rf.AmI(Candidate) && atomic.LoadInt32(&votes) > int32(len(rf.peers)/2) {
@@ -415,9 +412,10 @@ func (rf *Raft) leaderElection() {
 		}
 	}()
 
+	// inform other servers
 	for i := 0; i < len(rf.peers); i++ {
 		select {
-		case <-rf.stopLeaderElectionCh:
+		case <-ctx.Done():
 			return
 		default:
 		}
@@ -436,10 +434,11 @@ func (rf *Raft) leaderElection() {
 			// Call() is guaranteed to return, so there's no need to handle timeout ourselves
 			ok := rf.peers[i].Call("Raft.RequestVote", args, reply)
 			select {
-			case <-rf.stopLeaderElectionCh:
+			case <-ctx.Done():
 				return
 			default:
 			}
+			// return directly when term inconsistent
 			if args.Term != rf.GetCurrentTerm() {
 				return
 			}
@@ -448,19 +447,19 @@ func (rf *Raft) leaderElection() {
 				rf.Become(Follower)
 				rf.mu.Unlock()
 				DPrintf("%v-%v meet bigger term, back to Follower\n", rf.me, rf.GetCurrentTerm())
-				rf.stopLeaderElectionCh <- struct{}{}
+				cancel()
 				return
 			}
 			if ok {
-				if !rf.AmI(Candidate) {
-					return
-				}
+				//if !rf.AmI(Candidate) {
+				//	return
+				//}
 				if reply.Term > rf.GetCurrentTerm() {
 					rf.mu.Lock()
 					rf.Become(Follower)
 					rf.mu.Unlock()
 					DPrintf("%v-%v meet bigger term, back to Follower\n", rf.me, rf.GetCurrentTerm())
-					rf.stopLeaderElectionCh <- struct{}{}
+					cancel()
 					return
 				}
 				if reply.VoteGranted {
@@ -475,7 +474,6 @@ func (rf *Raft) leaderElection() {
 		}(i)
 	}
 	group.Wait()
-	rf.stopLeaderElectionCh <- struct{}{}
 }
 
 func (rf *Raft) heartbeat() {
@@ -504,7 +502,7 @@ func (rf *Raft) sendHeartbeat() {
 			defer group.Done()
 			args := &AppendEntriesArgs{
 				Term:     rf.GetCurrentTerm(),
-				LeaderId: rf.me,
+				LeaderId: rf.GetVoteFor(),
 				Entries:  nil,
 			}
 			reply := &AppendEntriesReply{}
@@ -545,7 +543,7 @@ func (rf *Raft) resetTimer() {
 	// heartbeats considerably more often than once per 150 milliseconds.
 	// So a larger range is suggested (300-450)
 	rf.timer.Stop()
-	rf.timer.Reset(time.Duration(rand.Intn(150)+300) * time.Millisecond)
+	rf.timer.Reset(time.Duration(rand.Intn(ElectionTimeoutRange)+300) * time.Millisecond)
 
 	//rf.randLock.Lock()
 	//timeout := rf.random.Intn(150) + 300
