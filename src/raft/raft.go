@@ -204,10 +204,10 @@ type RequestVoteReply struct {
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 	reply.Term = rf.GetCurrentTerm()
-	if t := rf.GetCurrentTerm(); args.Term < t {
+	if args.Term < rf.GetCurrentTerm() {
 		reply.VoteGranted = false
 		return
-	} else if args.Term > t {
+	} else if args.Term > rf.GetCurrentTerm() {
 		// stop leader election
 		if atomic.LoadInt32(&rf.state) == Candidate {
 			rf.stopLeaderElectionCh <- struct{}{}
@@ -224,7 +224,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// set reply args
 	if voteFor := rf.GetVoteFor(); voteFor == -1 || voteFor == args.CandidateId {
 		//(args.LastLogTerm == rf.currentTerm && args.LastLogIndex == rf.commitIndex) {
-		if voteFor == -1 {
+		if rf.GetVoteFor() == -1 {
 			rf.mu.Lock()
 			rf.SetVoteFor(args.CandidateId)
 			rf.mu.Unlock()
@@ -263,10 +263,13 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.resetTimer()
 		if args.Term > rf.GetCurrentTerm() {
 			rf.mu.Lock()
-			rf.Become(Follower)
-			DPrintf("%v-%v back to a Follower", rf.me, rf.GetCurrentTerm())
+			if !rf.AmI(Follower) {
+				rf.Become(Follower)
+				DPrintf("%v-%v back to a Follower", rf.me, rf.GetCurrentTerm())
+			}
 			rf.SetCurrentTerm(args.Term)
 			rf.mu.Unlock()
+			return
 		}
 		DPrintf("%v-%v get heartbeat from %v-%v\n", rf.me, rf.GetCurrentTerm(),
 			args.LeaderId, args.Term)
@@ -373,20 +376,18 @@ func (rf *Raft) ticker() {
 
 func (rf *Raft) leaderElection() {
 	// start an election
-	rf.mu.Lock()
-
 	rf.resetTimer()
+	rf.mu.Lock()
 	// vote for myself first
 	rf.SetVoteFor(int64(rf.me))
 	atomic.AddUint64(&rf.currentTerm, 1)
 	rf.Become(Candidate)
-
 	rf.mu.Unlock()
 
 	DPrintf("Server %v-%v started an election\n", rf.me, rf.GetCurrentTerm())
 
-	var votes int32
-	votes = 1
+	var agrees, disagrees int32
+	agrees, disagrees = 1, 0
 	group := sync.WaitGroup{}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -399,14 +400,26 @@ func (rf *Raft) leaderElection() {
 				cancel()
 				return
 			case <-ctx.Done():
-				DPrintf("Quit LE, %v-%v's total votes: %v\n", rf.me, rf.GetCurrentTerm(), atomic.LoadInt32(&votes))
+				DPrintf("Quit LE, %v-%v's total votes: %v\n", rf.me, rf.GetCurrentTerm(), atomic.LoadInt32(&agrees))
 				return
 			default:
-				if rf.AmI(Candidate) && atomic.LoadInt32(&votes) > int32(len(rf.peers)/2) {
+				if !rf.AmI(Candidate) {
+					continue
+				}
+				if atomic.LoadInt32(&agrees) > int32(len(rf.peers)/2) {
+					cancel()
 					rf.mu.Lock()
 					rf.Become(Leader)
 					rf.mu.Unlock()
 					DPrintf("Leader: %v-%v\n", rf.me, rf.GetCurrentTerm())
+					return
+				}
+				if atomic.LoadInt32(&disagrees) >= int32(len(rf.peers)/2) {
+					cancel()
+					rf.mu.Lock()
+					rf.Become(Follower)
+					rf.mu.Unlock()
+					return
 				}
 			}
 		}
@@ -440,40 +453,49 @@ func (rf *Raft) leaderElection() {
 			}
 			// return directly when term inconsistent
 			if args.Term != rf.GetCurrentTerm() {
+
 				return
 			}
-			if rf.GetCurrentTerm() > args.Term {
-				rf.mu.Lock()
-				rf.Become(Follower)
-				rf.mu.Unlock()
-				DPrintf("%v-%v meet bigger term, back to Follower\n", rf.me, rf.GetCurrentTerm())
-				cancel()
-				return
-			}
+			//if rf.GetCurrentTerm() > args.Term {
+			//	cancel()
+			//	rf.mu.Lock()
+			//	rf.Become(Follower)
+			//	rf.mu.Unlock()
+			//	DPrintf("%v-%v meet bigger term, back to Follower\n", rf.me, rf.GetCurrentTerm())
+			//	return
+			//}
 			if ok {
 				//if !rf.AmI(Candidate) {
 				//	return
 				//}
 				if reply.Term > rf.GetCurrentTerm() {
+					cancel()
 					rf.mu.Lock()
 					rf.Become(Follower)
 					rf.mu.Unlock()
 					DPrintf("%v-%v meet bigger term, back to Follower\n", rf.me, rf.GetCurrentTerm())
-					cancel()
 					return
 				}
 				if reply.VoteGranted {
 					rf.mu.Lock()
-					atomic.AddInt32(&votes, 1)
+					atomic.AddInt32(&agrees, 1)
 					rf.mu.Unlock()
-					DPrintf("%v got %v\n", rf.me, i)
+					//DPrintf("%v got %v\n", rf.me, i)
+				} else {
+					rf.mu.Lock()
+					atomic.AddInt32(&disagrees, 1)
+					rf.mu.Unlock()
 				}
 			} else {
+				rf.mu.Lock()
+				atomic.AddInt32(&disagrees, 1)
+				rf.mu.Unlock()
 				DPrintf("%v fail to RequestVote with %v\n", rf.me, i)
 			}
 		}(i)
 	}
 	group.Wait()
+
 }
 
 func (rf *Raft) heartbeat() {
@@ -490,6 +512,12 @@ func (rf *Raft) sendHeartbeat() {
 	DPrintf("%v-%v sending heartbeat\n", rf.me, rf.GetCurrentTerm())
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	// watch server's state
+	go func() {
+		for rf.AmI(Leader) {
+		}
+		cancel()
+	}()
 	group := sync.WaitGroup{}
 	for i := 0; i < len(rf.peers); i++ {
 		select {
@@ -516,20 +544,20 @@ func (rf *Raft) sendHeartbeat() {
 				return
 			}
 			if rf.GetCurrentTerm() > args.Term {
+				cancel()
 				rf.mu.Lock()
 				rf.Become(Follower)
 				rf.mu.Unlock()
 				DPrintf("%v-%v meet bigger term, back to Follower\n", rf.me, rf.GetCurrentTerm())
-				cancel()
 				return
 			}
 			if ok {
 				if reply.Term > rf.GetCurrentTerm() {
+					cancel()
 					rf.mu.Lock()
 					rf.SetCurrentTerm(reply.Term)
 					rf.Become(Follower)
 					rf.mu.Unlock()
-					cancel()
 				}
 			}
 		}(i)
