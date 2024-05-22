@@ -217,23 +217,23 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		if rf.AmI(Candidate) {
 			rf.stopLeaderElectionCh <- struct{}{}
 		}
-		rf.mu.Lock()
+		// rf.mu.Lock()
 		// which means we should change `voteFor` to the incoming id
 		if rf.GetVoteFor() != -1 {
 			rf.SetVoteFor(args.CandidateId)
 		}
 		rf.SetCurrentTerm(args.Term)
 		rf.Become(Follower)
-		rf.mu.Unlock()
+		// rf.mu.Unlock()
 	}
 	// set reply args
 	if voteFor := rf.GetVoteFor(); voteFor == -1 || voteFor == args.CandidateId {
 		rf.resetTimer()
 		reply.VoteGranted = true
 		if rf.GetVoteFor() == -1 {
-			rf.mu.Lock()
+			// rf.mu.Lock()
 			rf.SetVoteFor(args.CandidateId)
-			rf.mu.Unlock()
+			// rf.mu.Unlock()
 		}
 	} else {
 		reply.VoteGranted = false
@@ -272,13 +272,13 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			if rf.AmI(Candidate) {
 				rf.stopLeaderElectionCh <- struct{}{}
 			}
-			rf.mu.Lock()
+			// rf.mu.Lock()
 			if !rf.AmI(Follower) {
 				rf.Become(Follower)
 				DPrintf("%v-%v back to a Follower", rf.me, rf.GetCurrentTerm())
 			}
 			rf.SetCurrentTerm(args.Term)
-			rf.mu.Unlock()
+			// rf.mu.Unlock()
 			return
 		}
 		DPrintf("%v-%v get heartbeat from %v-%v\n", rf.me, rf.GetCurrentTerm(),
@@ -358,11 +358,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 // confusing debug output. any goroutine with a long-running loop
 // should call killed() to check whether it should stop.
 func (rf *Raft) Kill() {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
 	atomic.StoreInt32(&rf.dead, 1)
 	// Your code here, if desired.
-	//close(rf.stopLeaderElectionCh)
 }
 
 func (rf *Raft) killed() bool {
@@ -379,6 +376,8 @@ func (rf *Raft) ticker() {
 		// be started and to randomize sleeping time using
 		// time.Sleep().
 		<-rf.timer.C
+		// todo is it necessary to cleat channel here?
+		//ClearChannel(rf.stopLeaderElectionCh)
 		rf.leaderElection()
 	}
 	DPrintf("%v-%v quit ticker.\n", rf.me, rf.GetCurrentTerm())
@@ -416,29 +415,31 @@ func (rf *Raft) leaderElection() {
 				if atomic.LoadInt32(&agrees) > halfPeers {
 					cancel()
 					rf.startHeartbeatCh <- struct{}{}
-					rf.mu.Lock()
-					rf.Become(Leader)
-					rf.mu.Unlock()
+					// rf.mu.Lock()
+					if !rf.AmI(Follower) {
+						rf.Become(Leader)
+					}
+					// rf.mu.Unlock()
 					DPrintf("Leader: %v-%v\n", rf.me, rf.GetCurrentTerm())
 					return
 				}
 				if atomic.LoadInt32(&disagrees) >= halfPeers {
 					cancel()
-					rf.mu.Lock()
+					// rf.mu.Lock()
 					rf.Become(Follower)
-					rf.mu.Unlock()
+					// rf.mu.Unlock()
 					return
 				}
 			}
 		}
 	}()
 
-	rf.mu.Lock()
+	// rf.mu.Lock()
 	// vote for myself first
 	rf.SetVoteFor(int64(rf.me))
 	atomic.AddUint64(&rf.currentTerm, 1)
 	rf.Become(Candidate)
-	rf.mu.Unlock()
+	// rf.mu.Unlock()
 
 	DPrintf("Server %v-%v started an election\n", rf.me, rf.GetCurrentTerm())
 
@@ -447,11 +448,6 @@ func (rf *Raft) leaderElection() {
 
 	// inform other servers
 	for i := 0; i < len(rf.peers); i++ {
-		select {
-		case <-ctx.Done():
-			return
-		default:
-		}
 		if i == rf.me {
 			continue
 		}
@@ -485,9 +481,9 @@ func (rf *Raft) leaderElection() {
 			if ok {
 				if reply.Term > currentTerm {
 					cancel()
-					rf.mu.Lock()
+					// rf.mu.Lock()
 					rf.Become(Follower)
-					rf.mu.Unlock()
+					// rf.mu.Unlock()
 					DPrintf("%v-%v meet bigger term, back to Follower\n", rf.me, rf.GetCurrentTerm())
 					return
 				}
@@ -524,22 +520,18 @@ func (rf *Raft) heartbeat() {
 }
 
 func (rf *Raft) sendHeartbeat() {
+	rf.resetTimer()
 	DPrintf("%v-%v sending heartbeat\n", rf.me, rf.GetCurrentTerm())
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	// watch server's state
-	go func() {
-		for rf.AmI(Leader) {
-		}
-		cancel()
-	}()
+	//go func() {
+	//	for rf.AmI(Leader) {
+	//	}
+	//	cancel()
+	//}()
 	group := sync.WaitGroup{}
 	for i := 0; i < len(rf.peers); i++ {
-		select {
-		case <-ctx.Done():
-			return
-		default:
-		}
 		group.Add(1)
 		go func(i int) {
 			defer group.Done()
@@ -560,19 +552,19 @@ func (rf *Raft) sendHeartbeat() {
 			}
 			//if rf.GetCurrentTerm() > args.Term {
 			//	cancel()
-			//	rf.mu.Lock()
+			//	// rf.mu.Lock()
 			//	rf.Become(Follower)
-			//	rf.mu.Unlock()
+			//	// rf.mu.Unlock()
 			//	DPrintf("%v-%v meet bigger term, back to Follower\n", rf.me, rf.GetCurrentTerm())
 			//	return
 			//}
 			if ok {
 				if reply.Term > rf.GetCurrentTerm() {
 					cancel()
-					rf.mu.Lock()
+					// rf.mu.Lock()
 					rf.SetCurrentTerm(reply.Term)
 					rf.Become(Follower)
-					rf.mu.Unlock()
+					// rf.mu.Unlock()
 				}
 			}
 		}(i)

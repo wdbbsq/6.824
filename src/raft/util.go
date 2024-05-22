@@ -11,3 +11,10 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	}
 	return
 }
+
+func ClearChannel(ch chan struct{}) {
+	select {
+	case ch <- struct{}{}:
+	default:
+	}
+}
