@@ -93,8 +93,7 @@ type Raft struct {
 	timer                *time.Timer
 	state                State
 	random               *rand.Rand
-	randLock             sync.Mutex
-	heartbeatTimer       *time.Timer
+	heartbeatTicker      *time.Ticker
 	heartbeatLock        sync.Mutex
 	stopLeaderElectionCh chan struct{}
 	startHeartbeatCh     chan struct{}
@@ -360,6 +359,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
 	// Your code here, if desired.
+	rf.heartbeatTicker.Stop()
 }
 
 func (rf *Raft) killed() bool {
@@ -376,8 +376,6 @@ func (rf *Raft) ticker() {
 		// be started and to randomize sleeping time using
 		// time.Sleep().
 		<-rf.timer.C
-		// todo is it necessary to cleat channel here?
-		//ClearChannel(rf.stopLeaderElectionCh)
 		rf.leaderElection()
 	}
 	DPrintf("%v-%v quit ticker.\n", rf.me, rf.GetCurrentTerm())
@@ -391,14 +389,8 @@ func (rf *Raft) leaderElection() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// start a goroutine to watch votes
+	// start a goroutine to watch channel
 	go func() {
-		halfPeers := int32(len(rf.peers) / 2)
-		// quit on 4 conditions:
-		// 1. recv stopLECh signal.
-		// 2. recv waitGroup's Done signal
-		// 3. agrees > halfPeers
-		// 4. disagrees <= halfPeers
 		for {
 			select {
 			case <-rf.stopLeaderElectionCh:
@@ -407,32 +399,35 @@ func (rf *Raft) leaderElection() {
 			case <-ctx.Done():
 				DPrintf("Quit LE, %v-%v's total votes: %v\n", rf.me, rf.GetCurrentTerm(), atomic.LoadInt32(&agrees))
 				return
-			default:
-				if !rf.AmI(Candidate) {
-					cancel()
-					return
-				}
-				if atomic.LoadInt32(&agrees) > halfPeers {
-					cancel()
-					rf.startHeartbeatCh <- struct{}{}
-					// rf.mu.Lock()
-					if !rf.AmI(Follower) {
-						rf.Become(Leader)
-					}
-					// rf.mu.Unlock()
-					DPrintf("Leader: %v-%v\n", rf.me, rf.GetCurrentTerm())
-					return
-				}
-				if atomic.LoadInt32(&disagrees) >= halfPeers {
-					cancel()
-					// rf.mu.Lock()
-					rf.Become(Follower)
-					// rf.mu.Unlock()
-					return
-				}
 			}
 		}
 	}()
+
+	halfPeers := int32(len(rf.peers) / 2)
+	calcVotes := func() {
+		if !rf.AmI(Candidate) {
+			cancel()
+			return
+		}
+		if atomic.LoadInt32(&agrees) > halfPeers {
+			cancel()
+			rf.startHeartbeatCh <- struct{}{}
+			// rf.mu.Lock()
+			if !rf.AmI(Follower) {
+				rf.Become(Leader)
+			}
+			// rf.mu.Unlock()
+			DPrintf("Leader: %v-%v\n", rf.me, rf.GetCurrentTerm())
+			return
+		}
+		if atomic.LoadInt32(&disagrees) >= halfPeers {
+			cancel()
+			// rf.mu.Lock()
+			rf.Become(Follower)
+			// rf.mu.Unlock()
+			return
+		}
+	}
 
 	// rf.mu.Lock()
 	// vote for myself first
@@ -444,7 +439,6 @@ func (rf *Raft) leaderElection() {
 	DPrintf("Server %v-%v started an election\n", rf.me, rf.GetCurrentTerm())
 
 	group := sync.WaitGroup{}
-	mutex := sync.Mutex{}
 
 	// inform other servers
 	for i := 0; i < len(rf.peers); i++ {
@@ -470,9 +464,8 @@ func (rf *Raft) leaderElection() {
 			currentTerm := rf.GetCurrentTerm()
 			// return directly when term inconsistent
 			if args.Term != currentTerm {
-				mutex.Lock()
 				atomic.AddInt32(&disagrees, 1)
-				mutex.Unlock()
+				calcVotes()
 				return
 			}
 			if !rf.AmI(Candidate) {
@@ -487,19 +480,16 @@ func (rf *Raft) leaderElection() {
 					DPrintf("%v-%v meet bigger term, back to Follower\n", rf.me, rf.GetCurrentTerm())
 					return
 				}
-				mutex.Lock()
 				if reply.VoteGranted {
 					atomic.AddInt32(&agrees, 1)
 				} else {
 					atomic.AddInt32(&disagrees, 1)
 				}
-				mutex.Unlock()
 			} else {
-				mutex.Lock()
 				atomic.AddInt32(&disagrees, 1)
-				mutex.Unlock()
 				DPrintf("%v fail to RequestVote with %v\n", rf.me, i)
 			}
+			calcVotes()
 		}(i)
 	}
 	group.Wait()
@@ -510,7 +500,7 @@ func (rf *Raft) heartbeat() {
 		select {
 		case <-rf.startHeartbeatCh:
 			go rf.sendHeartbeat()
-		case <-rf.heartbeatTimer.C:
+		case <-rf.heartbeatTicker.C:
 			if rf.AmI(Leader) {
 				go rf.sendHeartbeat()
 			}
@@ -580,11 +570,19 @@ func (rf *Raft) resetTimer() {
 	//rf.timer.Stop()
 	//rf.timer.Reset(time.Duration(rand.Intn(ElectionTimeoutRange)+300) * time.Millisecond)
 
-	rf.randLock.Lock()
-	rf.timer.Stop()
-	timeout := rf.random.Intn(ElectionTimeoutRange) + 300
-	rf.randLock.Unlock()
-	rf.timer.Reset(time.Duration(timeout))
+	//rf.randLock.Lock()
+	//timeout := rf.random.Intn(ElectionTimeoutRange) + 300
+	//rf.randLock.Unlock()
+
+	// timer has not expired yet
+	if !rf.timer.Stop() {
+		// clear timer channel without draining
+		select {
+		case <-rf.timer.C:
+		default:
+		}
+	}
+	rf.timer.Reset(time.Duration(rand.Intn(ElectionTimeoutRange)+300) * time.Millisecond)
 }
 
 // the service or tester wants to create a Raft server. the ports
@@ -618,11 +616,10 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.random = rand.New(rand.NewSource(time.Now().UnixNano()))
 
 	rf.mu = sync.Mutex{}
-	rf.randLock = sync.Mutex{}
 	rf.heartbeatLock = sync.Mutex{}
 
 	rf.timer = time.NewTimer(time.Minute)
-	rf.heartbeatTimer = time.NewTimer(HeartbeatInterval)
+	rf.heartbeatTicker = time.NewTicker(HeartbeatInterval)
 
 	rf.stopLeaderElectionCh = make(chan struct{})
 	rf.startHeartbeatCh = make(chan struct{})
