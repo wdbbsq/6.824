@@ -94,7 +94,6 @@ type Raft struct {
 	state                State
 	random               *rand.Rand
 	heartbeatTicker      *time.Ticker
-	heartbeatLock        sync.Mutex
 	stopLeaderElectionCh chan struct{}
 	startHeartbeatCh     chan struct{}
 }
@@ -216,23 +215,19 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		if rf.AmI(Candidate) {
 			rf.stopLeaderElectionCh <- struct{}{}
 		}
-		// rf.mu.Lock()
 		// which means we should change `voteFor` to the incoming id
 		if rf.GetVoteFor() != -1 {
 			rf.SetVoteFor(args.CandidateId)
 		}
 		rf.SetCurrentTerm(args.Term)
 		rf.Become(Follower)
-		// rf.mu.Unlock()
 	}
 	// set reply args
 	if voteFor := rf.GetVoteFor(); voteFor == -1 || voteFor == args.CandidateId {
 		rf.resetTimer()
 		reply.VoteGranted = true
 		if rf.GetVoteFor() == -1 {
-			// rf.mu.Lock()
 			rf.SetVoteFor(args.CandidateId)
-			// rf.mu.Unlock()
 		}
 	} else {
 		reply.VoteGranted = false
@@ -271,13 +266,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			if rf.AmI(Candidate) {
 				rf.stopLeaderElectionCh <- struct{}{}
 			}
-			// rf.mu.Lock()
 			if !rf.AmI(Follower) {
 				rf.Become(Follower)
 				DPrintf("%v-%v back to a Follower", rf.me, rf.GetCurrentTerm())
 			}
 			rf.SetCurrentTerm(args.Term)
-			// rf.mu.Unlock()
 			return
 		}
 		DPrintf("%v-%v get heartbeat from %v-%v\n", rf.me, rf.GetCurrentTerm(),
@@ -412,29 +405,23 @@ func (rf *Raft) leaderElection() {
 		if atomic.LoadInt32(&agrees) > halfPeers {
 			cancel()
 			rf.startHeartbeatCh <- struct{}{}
-			// rf.mu.Lock()
 			if !rf.AmI(Follower) {
 				rf.Become(Leader)
 			}
-			// rf.mu.Unlock()
 			DPrintf("Leader: %v-%v\n", rf.me, rf.GetCurrentTerm())
 			return
 		}
 		if atomic.LoadInt32(&disagrees) >= halfPeers {
 			cancel()
-			// rf.mu.Lock()
 			rf.Become(Follower)
-			// rf.mu.Unlock()
 			return
 		}
 	}
 
-	// rf.mu.Lock()
 	// vote for myself first
 	rf.SetVoteFor(int64(rf.me))
 	atomic.AddUint64(&rf.currentTerm, 1)
 	rf.Become(Candidate)
-	// rf.mu.Unlock()
 
 	DPrintf("Server %v-%v started an election\n", rf.me, rf.GetCurrentTerm())
 
@@ -474,9 +461,7 @@ func (rf *Raft) leaderElection() {
 			if ok {
 				if reply.Term > currentTerm {
 					cancel()
-					// rf.mu.Lock()
 					rf.Become(Follower)
-					// rf.mu.Unlock()
 					DPrintf("%v-%v meet bigger term, back to Follower\n", rf.me, rf.GetCurrentTerm())
 					return
 				}
@@ -514,14 +499,12 @@ func (rf *Raft) sendHeartbeat() {
 	DPrintf("%v-%v sending heartbeat\n", rf.me, rf.GetCurrentTerm())
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	// watch server's state
-	//go func() {
-	//	for rf.AmI(Leader) {
-	//	}
-	//	cancel()
-	//}()
+
 	group := sync.WaitGroup{}
 	for i := 0; i < len(rf.peers); i++ {
+		if rf.me == i {
+			continue
+		}
 		group.Add(1)
 		go func(i int) {
 			defer group.Done()
@@ -540,21 +523,12 @@ func (rf *Raft) sendHeartbeat() {
 			if args.Term != rf.GetCurrentTerm() {
 				return
 			}
-			//if rf.GetCurrentTerm() > args.Term {
-			//	cancel()
-			//	// rf.mu.Lock()
-			//	rf.Become(Follower)
-			//	// rf.mu.Unlock()
-			//	DPrintf("%v-%v meet bigger term, back to Follower\n", rf.me, rf.GetCurrentTerm())
-			//	return
-			//}
+
 			if ok {
 				if reply.Term > rf.GetCurrentTerm() {
-					cancel()
-					// rf.mu.Lock()
-					rf.SetCurrentTerm(reply.Term)
 					rf.Become(Follower)
-					// rf.mu.Unlock()
+					rf.SetCurrentTerm(reply.Term)
+					cancel()
 				}
 			}
 		}(i)
@@ -567,16 +541,9 @@ func (rf *Raft) resetTimer() {
 	// 6.824: Such a range only makes sense if the leader sends
 	// heartbeats considerably more often than once per 150 milliseconds.
 	// So a larger range is suggested (300-450)
-	//rf.timer.Stop()
-	//rf.timer.Reset(time.Duration(rand.Intn(ElectionTimeoutRange)+300) * time.Millisecond)
 
-	//rf.randLock.Lock()
-	//timeout := rf.random.Intn(ElectionTimeoutRange) + 300
-	//rf.randLock.Unlock()
-
-	// timer has not expired yet
 	if !rf.timer.Stop() {
-		// clear timer channel without draining
+		// clear timer channel without draining if the timer has not expired yet
 		select {
 		case <-rf.timer.C:
 		default:
@@ -616,7 +583,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.random = rand.New(rand.NewSource(time.Now().UnixNano()))
 
 	rf.mu = sync.Mutex{}
-	rf.heartbeatLock = sync.Mutex{}
 
 	rf.timer = time.NewTimer(time.Minute)
 	rf.heartbeatTicker = time.NewTicker(HeartbeatInterval)
