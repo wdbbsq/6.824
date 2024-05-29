@@ -65,7 +65,7 @@ type ApplyMsg struct {
 }
 
 type LogEntry struct {
-	Term    int
+	Term    uint64
 	Command interface{}
 }
 
@@ -96,6 +96,7 @@ type Raft struct {
 	heartbeatTicker      *time.Ticker
 	stopLeaderElectionCh chan struct{}
 	startHeartbeatCh     chan struct{}
+	entryCh              chan LogEntry
 }
 
 // return currentTerm and whether this server
@@ -331,13 +332,23 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 // term. the third return value is true if this server believes it is
 // the leader.
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	index := -1
-	term := -1
-	isLeader := true
+	index := rf.commitIndex
+	term := rf.GetCurrentTerm()
+	isLeader := rf.AmI(Leader)
 
 	// Your code here (2B).
+	if isLeader {
+		go rf.handleCommand(command)
+	}
 
-	return index, term, isLeader
+	return index, int(term), isLeader
+}
+
+func (rf *Raft) handleCommand(command interface{}) {
+	rf.entryCh <- LogEntry{
+		Term:    rf.GetCurrentTerm(),
+		Command: command,
+	}
 }
 
 // the tester doesn't halt goroutines created by Raft after each test,
@@ -484,23 +495,37 @@ func (rf *Raft) heartbeat() {
 	for rf.killed() == false {
 		select {
 		case <-rf.startHeartbeatCh:
-			go rf.sendHeartbeat()
+			go rf.sendAppendEntries()
 		case <-rf.heartbeatTicker.C:
 			if rf.AmI(Leader) {
-				go rf.sendHeartbeat()
+				go rf.sendAppendEntries()
 			}
 		}
 	}
 	DPrintf("%v-%v quit heartbeat.\n", rf.me, rf.GetCurrentTerm())
 }
 
-func (rf *Raft) sendHeartbeat() {
+func (rf *Raft) sendAppendEntries() {
 	rf.resetTimer()
 	DPrintf("%v-%v sending heartbeat\n", rf.me, rf.GetCurrentTerm())
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	group := sync.WaitGroup{}
+	// build params
+	term := rf.GetCurrentTerm()
+	leaderId := rf.GetVoteFor()
+	entriesLength := len(rf.entryCh)
+	entries := make([]LogEntry, entriesLength)
+	for i := 0; i < entriesLength; i++ {
+		entries = append(entries, <-rf.entryCh)
+	}
+	var preLogIndex int
+	var preLogTerm uint64
+	if rf.commitIndex == 0 {
+
+	}
+	// send request to other servers
 	for i := 0; i < len(rf.peers); i++ {
 		if rf.me == i {
 			continue
@@ -509,9 +534,12 @@ func (rf *Raft) sendHeartbeat() {
 		go func(i int) {
 			defer group.Done()
 			args := &AppendEntriesArgs{
-				Term:     rf.GetCurrentTerm(),
-				LeaderId: rf.GetVoteFor(),
-				Entries:  nil,
+				Term:         term,
+				LeaderId:     leaderId,
+				PrevLogIndex: preLogIndex,
+				PrevLogTerm:  preLogTerm,
+				Entries:      entries,
+				LeaderCommit: rf.commitIndex,
 			}
 			reply := &AppendEntriesReply{}
 			ok := rf.peers[i].Call("Raft.AppendEntries", args, reply)
@@ -529,7 +557,9 @@ func (rf *Raft) sendHeartbeat() {
 					rf.Become(Follower)
 					rf.SetCurrentTerm(reply.Term)
 					cancel()
+					return
 				}
+
 			}
 		}(i)
 	}
@@ -589,6 +619,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	rf.stopLeaderElectionCh = make(chan struct{})
 	rf.startHeartbeatCh = make(chan struct{})
+	rf.entryCh = make(chan LogEntry, 100)
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
